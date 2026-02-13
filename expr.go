@@ -194,3 +194,34 @@ func literalToFloat64(v any) (float64, bool) {
 		return 0, false
 	}
 }
+
+func exprColumns(e Expr) []string {
+	switch x := e.(type) {
+	case compareExpr:
+		return []string{x.left}
+	case evenExpr:
+		return []string{x.col}
+	case logicalExpr:
+		l := exprColumns(x.left)
+		r := exprColumns(x.right)
+		out := make([]string, 0, len(l)+len(r))
+		seen := map[string]struct{}{}
+		for i := range l {
+			if _, ok := seen[l[i]]; ok {
+				continue
+			}
+			seen[l[i]] = struct{}{}
+			out = append(out, l[i])
+		}
+		for i := range r {
+			if _, ok := seen[r[i]]; ok {
+				continue
+			}
+			seen[r[i]] = struct{}{}
+			out = append(out, r[i])
+		}
+		return out
+	default:
+		return nil
+	}
+}

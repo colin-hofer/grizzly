@@ -11,36 +11,45 @@ import (
 
 const csvTypeSampleRows = 8192
 
+type csvReadPlan struct {
+	projection map[string]struct{}
+	filterEven string
+}
+
 type typedBuilder interface {
 	Append(raw string, row int) error
 	Build(name string) Column
 }
 
-type int64Builder struct {
-	data  []int64
-	valid bitmapBuilder
-	nulls map[string]struct{}
+type genericBuilder[T any] struct {
+	data      []T
+	valid     bitmapBuilder
+	nulls     map[string]struct{}
+	parse     func(string) (T, error)
+	construct func(name string, data []T, valid bitmap) Column
 }
 
-type float64Builder struct {
-	data  []float64
-	valid bitmapBuilder
-	nulls map[string]struct{}
+func (b *genericBuilder[T]) Append(raw string, row int) error {
+	var zero T
+	b.data = append(b.data, zero)
+	if _, ok := b.nulls[raw]; ok {
+		b.valid.Append(false)
+		return nil
+	}
+	v, err := b.parse(raw)
+	if err != nil {
+		return fmt.Errorf("row %d parse value: %w", row, err)
+	}
+	b.data[len(b.data)-1] = v
+	b.valid.Append(true)
+	return nil
 }
 
-type boolBuilder struct {
-	data  []bool
-	valid bitmapBuilder
-	nulls map[string]struct{}
+func (b *genericBuilder[T]) Build(name string) Column {
+	return b.construct(name, b.data, b.valid.Build())
 }
 
-type utf8Builder struct {
-	data  []string
-	valid bitmapBuilder
-	nulls map[string]struct{}
-}
-
-func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
+func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -70,7 +79,40 @@ func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
 		nulls[opts.NullValues[i]] = struct{}{}
 	}
 
-	samples := make([][]string, len(header))
+	headerIdx := make(map[string]int, len(header))
+	for i := range header {
+		headerIdx[header[i]] = i
+	}
+
+	included := make([]int, 0, len(header))
+	includedNames := make([]string, 0, len(header))
+	if len(plan.projection) == 0 {
+		for i := range header {
+			included = append(included, i)
+			includedNames = append(includedNames, header[i])
+		}
+	} else {
+		for i := range header {
+			if _, ok := plan.projection[header[i]]; ok {
+				included = append(included, i)
+				includedNames = append(includedNames, header[i])
+			}
+		}
+		if len(included) == 0 {
+			return nil, fmt.Errorf("projection selected no columns")
+		}
+	}
+
+	filterIdx := -1
+	if plan.filterEven != "" {
+		i, ok := headerIdx[plan.filterEven]
+		if !ok {
+			return nil, fmt.Errorf("unknown filter column %s", plan.filterEven)
+		}
+		filterIdx = i
+	}
+
+	samples := make([][]string, len(included))
 	for i := range samples {
 		samples[i] = make([]string, 0, csvTypeSampleRows)
 	}
@@ -86,15 +128,19 @@ func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
 		if len(rec) != len(header) {
 			return nil, fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
 		}
-		cp := append([]string(nil), rec...)
-		records = append(records, cp)
-		for i := range cp {
-			samples[i] = append(samples[i], cp[i])
+		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
+			continue
 		}
+		projected := make([]string, len(included))
+		for i, src := range included {
+			projected[i] = rec[src]
+			samples[i] = append(samples[i], rec[src])
+		}
+		records = append(records, projected)
 	}
 
-	builders := make([]typedBuilder, len(header))
-	for i := range header {
+	builders := make([]typedBuilder, len(included))
+	for i := range included {
 		builders[i] = newBuilder(inferType(samples[i], nulls), nulls)
 	}
 
@@ -119,17 +165,20 @@ func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
 		if len(rec) != len(header) {
 			return nil, fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
 		}
-		for i := range rec {
-			if err := builders[i].Append(rec[i], row); err != nil {
+		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
+			continue
+		}
+		for i, src := range included {
+			if err := builders[i].Append(rec[src], row); err != nil {
 				return nil, err
 			}
 		}
 		row++
 	}
 
-	cols := make([]Column, len(header))
-	for i := range header {
-		cols[i] = builders[i].Build(header[i])
+	cols := make([]Column, len(included))
+	for i := range cols {
+		cols[i] = builders[i].Build(includedNames[i])
 	}
 	return NewDataFrame(cols...)
 }
@@ -137,78 +186,50 @@ func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
 func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
 	switch dtype {
 	case DTypeInt64:
-		return &int64Builder{data: make([]int64, 0, 16384), nulls: nulls}
+		return &genericBuilder[int64]{
+			data:  make([]int64, 0, 16384),
+			nulls: nulls,
+			parse: func(raw string) (int64, error) {
+				return strconv.ParseInt(raw, 10, 64)
+			},
+			construct: func(name string, data []int64, valid bitmap) Column {
+				return newInt64ColumnOwned(name, data, valid)
+			},
+		}
 	case DTypeFloat64:
-		return &float64Builder{data: make([]float64, 0, 16384), nulls: nulls}
+		return &genericBuilder[float64]{
+			data:  make([]float64, 0, 16384),
+			nulls: nulls,
+			parse: func(raw string) (float64, error) {
+				return strconv.ParseFloat(raw, 64)
+			},
+			construct: func(name string, data []float64, valid bitmap) Column {
+				return newFloat64ColumnOwned(name, data, valid)
+			},
+		}
 	case DTypeBool:
-		return &boolBuilder{data: make([]bool, 0, 16384), nulls: nulls}
+		return &genericBuilder[bool]{
+			data:  make([]bool, 0, 16384),
+			nulls: nulls,
+			parse: func(raw string) (bool, error) {
+				return strconv.ParseBool(strings.ToLower(raw))
+			},
+			construct: func(name string, data []bool, valid bitmap) Column {
+				return newBoolColumnOwned(name, data, valid)
+			},
+		}
 	default:
-		return &utf8Builder{data: make([]string, 0, 16384), nulls: nulls}
+		return &genericBuilder[string]{
+			data:  make([]string, 0, 16384),
+			nulls: nulls,
+			parse: func(raw string) (string, error) {
+				return raw, nil
+			},
+			construct: func(name string, data []string, valid bitmap) Column {
+				return newUtf8ColumnOwned(name, data, valid)
+			},
+		}
 	}
-}
-
-func (b *int64Builder) Append(raw string, row int) error {
-	b.data = append(b.data, 0)
-	if _, ok := b.nulls[raw]; ok {
-		b.valid.Append(false)
-		return nil
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return fmt.Errorf("row %d parse int64: %w", row, err)
-	}
-	b.data[len(b.data)-1] = v
-	b.valid.Append(true)
-	return nil
-}
-func (b *int64Builder) Build(name string) Column {
-	return newInt64ColumnOwned(name, b.data, b.valid.Build())
-}
-
-func (b *float64Builder) Append(raw string, row int) error {
-	b.data = append(b.data, 0)
-	if _, ok := b.nulls[raw]; ok {
-		b.valid.Append(false)
-		return nil
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return fmt.Errorf("row %d parse float64: %w", row, err)
-	}
-	b.data[len(b.data)-1] = v
-	b.valid.Append(true)
-	return nil
-}
-func (b *float64Builder) Build(name string) Column {
-	return newFloat64ColumnOwned(name, b.data, b.valid.Build())
-}
-
-func (b *boolBuilder) Append(raw string, row int) error {
-	b.data = append(b.data, false)
-	if _, ok := b.nulls[raw]; ok {
-		b.valid.Append(false)
-		return nil
-	}
-	v, err := strconv.ParseBool(strings.ToLower(raw))
-	if err != nil {
-		return fmt.Errorf("row %d parse bool: %w", row, err)
-	}
-	b.data[len(b.data)-1] = v
-	b.valid.Append(true)
-	return nil
-}
-func (b *boolBuilder) Build(name string) Column {
-	return newBoolColumnOwned(name, b.data, b.valid.Build())
-}
-
-func (b *utf8Builder) Append(raw string, _ int) error {
-	b.data = append(b.data, raw)
-	_, isNull := b.nulls[raw]
-	b.valid.Append(!isNull)
-	return nil
-}
-func (b *utf8Builder) Build(name string) Column {
-	return newUtf8ColumnOwned(name, b.data, b.valid.Build())
 }
 
 func inferType(values []string, nullSet map[string]struct{}) DType {
@@ -242,4 +263,14 @@ func inferType(values []string, nullSet map[string]struct{}) DType {
 		return DTypeBool
 	}
 	return DTypeUtf8
+}
+
+func rawEven(raw string, nulls map[string]struct{}) bool {
+	if _, ok := nulls[raw]; ok {
+		return false
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return n%2 == 0
+	}
+	return len(raw)%2 == 0
 }

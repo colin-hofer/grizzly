@@ -5,10 +5,18 @@
 ## Core Design
 
 - Typed columnar memory (`int64`, `float64`, `bool`, `utf8`) with validity bitmaps
+- Generic column and builder internals to keep implementation compact without runtime interface overhead in hot loops
 - Expression-based filtering (`Col("x").Gt(...)`, `Col("id").Even()`) instead of row callbacks
-- Lazy query plans with simple optimization (filter push-up)
+- Lazy query plans with optimization passes (filter reordering, CSV filter pushdown for supported predicates, projection pushdown when `Select` is present)
 - Deterministic projection checksums for correctness verification
 - CSV + JSON scanners as pluggable sources
+
+## Performance Notes
+
+- CSV ingestion uses single-pass typed builders after a bounded schema sample window
+- `Filter` and `Take` use exact-size allocations to reduce GC pressure
+- Sort uses type-specialized kernels for primitive columns
+- JSON serialization writes rows directly to an output buffer, avoiding map-heavy intermediate structures
 
 ## Quick Example
 

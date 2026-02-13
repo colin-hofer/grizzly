@@ -7,8 +7,6 @@ type ScanOptions struct {
 	NullValues []string
 }
 
-type jsonScanOptions struct{}
-
 type sourceKind uint8
 
 const (
@@ -76,9 +74,29 @@ func (lf *LazyFrame) Collect() (*DataFrame, error) {
 	optimized := lf.optimize()
 	var df *DataFrame
 	var err error
+	if optimized.source.kind == sourceCSV {
+		readPlan, remainingOps := optimized.csvReadPlan()
+		df, err = readCSV(optimized.source.path, optimized.source.csv, readPlan)
+		if err != nil {
+			return nil, err
+		}
+		for _, op := range remainingOps {
+			switch op.typeID {
+			case opFilter:
+				df, err = df.Filter(op.filter)
+			case opSelect:
+				df, err = df.Select(op.cols...)
+			case opSort:
+				df, err = df.SortBy(op.sortBy, op.desc)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		return df, nil
+	}
+
 	switch optimized.source.kind {
-	case sourceCSV:
-		df, err = readCSV(optimized.source.path, optimized.source.csv)
 	case sourceJSON:
 		df, err = readJSON(optimized.source.path)
 	default:
@@ -116,4 +134,47 @@ func (lf *LazyFrame) optimize() *LazyFrame {
 	next := *lf
 	next.ops = append(filters, other...)
 	return &next
+}
+
+func (lf *LazyFrame) csvReadPlan() (csvReadPlan, []planOp) {
+	plan := csvReadPlan{}
+	remaining := make([]planOp, 0, len(lf.ops))
+
+	for i := range lf.ops {
+		op := lf.ops[i]
+		if op.typeID == opFilter {
+			if ev, ok := op.filter.(evenExpr); ok && plan.filterEven == "" {
+				plan.filterEven = ev.col
+				continue
+			}
+		}
+		remaining = append(remaining, op)
+	}
+
+	selected := false
+	needed := map[string]struct{}{}
+	for i := range remaining {
+		op := remaining[i]
+		switch op.typeID {
+		case opSelect:
+			selected = true
+			for j := range op.cols {
+				needed[op.cols[j]] = struct{}{}
+			}
+		case opSort:
+			needed[op.sortBy] = struct{}{}
+		case opFilter:
+			for _, c := range exprColumns(op.filter) {
+				needed[c] = struct{}{}
+			}
+		}
+	}
+	if selected {
+		if plan.filterEven != "" {
+			needed[plan.filterEven] = struct{}{}
+		}
+		plan.projection = needed
+	}
+
+	return plan, remaining
 }
