@@ -14,9 +14,11 @@
 ## Performance Notes
 
 - CSV ingestion uses single-pass typed builders after a bounded schema sample window
+- CSV scan uses chunked parallel parsing after schema sampling
 - `Filter` and `Take` use exact-size allocations to reduce GC pressure
-- Sort uses type-specialized kernels for primitive columns
+- Sort uses type-specialized kernels and parallel stable merge-sort for large frames
 - JSON serialization writes rows directly to an output buffer, avoiding map-heavy intermediate structures
+- UTF-8 columns are stored as offset+byte buffers, reducing string-object overhead
 
 ## Quick Example
 

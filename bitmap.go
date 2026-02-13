@@ -53,3 +53,17 @@ func (b *bitmapBuilder) Append(valid bool) {
 func (b *bitmapBuilder) Build() bitmap {
 	return bitmap{bits: b.bits}
 }
+
+func (b *bitmapBuilder) Len() int {
+	return b.n
+}
+
+func (b *bitmapBuilder) Get(i int) bool {
+	return (b.bits[i/64]>>(uint(i%64)))&1 == 1
+}
+
+func (b *bitmapBuilder) AppendFrom(other *bitmapBuilder) {
+	for i := 0; i < other.n; i++ {
+		b.Append(other.Get(i))
+	}
+}

@@ -4,12 +4,16 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+
+	"os"
 )
 
 const csvTypeSampleRows = 8192
+const csvChunkRows = 4096
 
 type csvReadPlan struct {
 	projection map[string]struct{}
@@ -19,6 +23,7 @@ type csvReadPlan struct {
 type typedBuilder interface {
 	Append(raw string, row int) error
 	Build(name string) Column
+	AppendBuilder(other typedBuilder) error
 }
 
 type genericBuilder[T any] struct {
@@ -47,6 +52,53 @@ func (b *genericBuilder[T]) Append(raw string, row int) error {
 
 func (b *genericBuilder[T]) Build(name string) Column {
 	return b.construct(name, b.data, b.valid.Build())
+}
+
+func (b *genericBuilder[T]) AppendBuilder(other typedBuilder) error {
+	o, ok := other.(*genericBuilder[T])
+	if !ok {
+		return fmt.Errorf("builder type mismatch")
+	}
+	b.data = append(b.data, o.data...)
+	b.valid.AppendFrom(&o.valid)
+	return nil
+}
+
+type utf8Builder struct {
+	offsets []int32
+	bytes   []byte
+	valid   bitmapBuilder
+	nulls   map[string]struct{}
+}
+
+func (b *utf8Builder) Append(raw string, _ int) error {
+	if _, ok := b.nulls[raw]; ok {
+		b.valid.Append(false)
+		b.offsets = append(b.offsets, int32(len(b.bytes)))
+		return nil
+	}
+	b.valid.Append(true)
+	b.bytes = append(b.bytes, raw...)
+	b.offsets = append(b.offsets, int32(len(b.bytes)))
+	return nil
+}
+
+func (b *utf8Builder) Build(name string) Column {
+	return newUtf8ColumnOwned(name, b.offsets, b.bytes, b.valid.Build())
+}
+
+func (b *utf8Builder) AppendBuilder(other typedBuilder) error {
+	o, ok := other.(*utf8Builder)
+	if !ok {
+		return fmt.Errorf("builder type mismatch")
+	}
+	base := int32(len(b.bytes))
+	b.bytes = append(b.bytes, o.bytes...)
+	for i := 1; i < len(o.offsets); i++ {
+		b.offsets = append(b.offsets, o.offsets[i]+base)
+	}
+	b.valid.AppendFrom(&o.valid)
+	return nil
 }
 
 func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error) {
@@ -139,9 +191,14 @@ func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error
 		records = append(records, projected)
 	}
 
+	dtypes := make([]DType, len(included))
+	for i := range included {
+		dtypes[i] = inferType(samples[i], nulls)
+	}
+
 	builders := make([]typedBuilder, len(included))
 	for i := range included {
-		builders[i] = newBuilder(inferType(samples[i], nulls), nulls)
+		builders[i] = newBuilder(dtypes[i], nulls)
 	}
 
 	row := 1
@@ -154,26 +211,8 @@ func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error
 		row++
 	}
 
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if len(rec) != len(header) {
-			return nil, fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
-		}
-		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
-			continue
-		}
-		for i, src := range included {
-			if err := builders[i].Append(rec[src], row); err != nil {
-				return nil, err
-			}
-		}
-		row++
+	if err := parseRemainingCSVParallel(r, header, included, filterIdx, nulls, dtypes, builders, row); err != nil {
+		return nil, err
 	}
 
 	cols := make([]Column, len(included))
@@ -181,6 +220,144 @@ func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error
 		cols[i] = builders[i].Build(includedNames[i])
 	}
 	return NewDataFrame(cols...)
+}
+
+type parseJob struct {
+	index int
+	rows  [][]string
+}
+
+func parseRemainingCSVParallel(r *csv.Reader, header []string, included []int, filterIdx int, nulls map[string]struct{}, dtypes []DType, builders []typedBuilder, startRow int) error {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		return parseRemainingCSVSequential(r, header, included, filterIdx, nulls, builders, startRow)
+	}
+
+	chunk := make([][]string, 0, csvChunkRows)
+	chunkIndex := 0
+	batch := make([]parseJob, 0, workers*2)
+
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		results, err := parseBatch(batch, dtypes, nulls, startRow)
+		if err != nil {
+			return err
+		}
+		for _, res := range results {
+			for j := range builders {
+				if err := builders[j].AppendBuilder(res[j]); err != nil {
+					return err
+				}
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	flushChunk := func() {
+		if len(chunk) == 0 {
+			return
+		}
+		cp := make([][]string, len(chunk))
+		copy(cp, chunk)
+		batch = append(batch, parseJob{index: chunkIndex, rows: cp})
+		chunkIndex++
+		chunk = make([][]string, 0, csvChunkRows)
+	}
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(rec) != len(header) {
+			return fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
+		}
+		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
+			continue
+		}
+		projected := make([]string, len(included))
+		for i, src := range included {
+			projected[i] = rec[src]
+		}
+		chunk = append(chunk, projected)
+		if len(chunk) >= csvChunkRows {
+			flushChunk()
+			if len(batch) >= workers*2 {
+				if err := flushBatch(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	flushChunk()
+	if err := flushBatch(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseBatch(batch []parseJob, dtypes []DType, nulls map[string]struct{}, startRow int) ([][]typedBuilder, error) {
+	results := make([][]typedBuilder, len(batch))
+	errCh := make(chan error, len(batch))
+	var wg sync.WaitGroup
+	for i := range batch {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			job := batch[i]
+			local := make([]typedBuilder, len(dtypes))
+			for j := range dtypes {
+				local[j] = newBuilder(dtypes[j], nulls)
+			}
+			row := startRow + job.index*csvChunkRows
+			for r := range job.rows {
+				for c := range job.rows[r] {
+					if err := local[c].Append(job.rows[r][c], row+r); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}
+			results[i] = local
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	if err, ok := <-errCh; ok {
+		return nil, err
+	}
+	return results, nil
+}
+
+func parseRemainingCSVSequential(r *csv.Reader, header []string, included []int, filterIdx int, nulls map[string]struct{}, builders []typedBuilder, row int) error {
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(rec) != len(header) {
+			return fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
+		}
+		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
+			continue
+		}
+		for i, src := range included {
+			if err := builders[i].Append(rec[src], row); err != nil {
+				return err
+			}
+		}
+		row++
+	}
+	return nil
 }
 
 func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
@@ -219,15 +396,10 @@ func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
 			},
 		}
 	default:
-		return &genericBuilder[string]{
-			data:  make([]string, 0, 16384),
-			nulls: nulls,
-			parse: func(raw string) (string, error) {
-				return raw, nil
-			},
-			construct: func(name string, data []string, valid bitmap) Column {
-				return newUtf8ColumnOwned(name, data, valid)
-			},
+		return &utf8Builder{
+			offsets: make([]int32, 1, 16385),
+			bytes:   make([]byte, 0, 131072),
+			nulls:   nulls,
 		}
 	}
 }

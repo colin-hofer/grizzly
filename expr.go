@@ -42,6 +42,10 @@ func (e compareExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 	}
 	vals := make([]bool, col.Len())
 	valid := make([]bool, col.Len())
+	var utf8Lit []byte
+	if _, ok := col.(*Utf8Column); ok {
+		utf8Lit = []byte(fmt.Sprint(e.right))
+	}
 	for i := range vals {
 		if col.IsNull(i) {
 			continue
@@ -69,11 +73,10 @@ func (e compareExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 				vals[i] = c.Value(i) > r
 			}
 		case *Utf8Column:
-			r := fmt.Sprint(e.right)
 			if e.op == "eq" {
-				vals[i] = c.Value(i) == r
+				vals[i] = c.compareLiteral(i, utf8Lit) == 0
 			} else {
-				vals[i] = c.Value(i) > r
+				vals[i] = c.compareLiteral(i, utf8Lit) > 0
 			}
 		case *BoolColumn:
 			r, ok := e.right.(bool)
@@ -114,7 +117,7 @@ func (e evenExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 		case *Float64Column:
 			vals[i] = int64(c.Value(i))%2 == 0
 		case *Utf8Column:
-			vals[i] = len(c.Value(i))%2 == 0
+			vals[i] = c.valueLen(i)%2 == 0
 		case *BoolColumn:
 			vals[i] = !c.Value(i)
 		default:
