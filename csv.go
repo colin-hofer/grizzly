@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,24 +21,65 @@ type csvReadPlan struct {
 	filterEven string
 }
 
+type nullMatcher struct {
+	single string
+	set    map[string]struct{}
+}
+
+func newNullMatcher(values []string) nullMatcher {
+	if len(values) == 1 {
+		return nullMatcher{single: values[0]}
+	}
+	set := make(map[string]struct{}, len(values))
+	for i := range values {
+		set[values[i]] = struct{}{}
+	}
+	if len(set) == 1 {
+		for k := range set {
+			return nullMatcher{single: k}
+		}
+	}
+	return nullMatcher{set: set}
+}
+
+func (m nullMatcher) IsNull(raw string) bool {
+	if m.set == nil {
+		return raw == m.single
+	}
+	_, ok := m.set[raw]
+	return ok
+}
+
 type typedBuilder interface {
 	Append(raw string, row int) error
 	Build(name string) Column
 	AppendBuilder(other typedBuilder) error
 }
 
+type reservableBuilder interface {
+	Reserve(addRows int, addBytes int)
+}
+
 type genericBuilder[T any] struct {
 	data      []T
 	valid     bitmapBuilder
-	nulls     map[string]struct{}
+	nulls     nullMatcher
 	parse     func(string) (T, error)
 	construct func(name string, data []T, valid bitmap) Column
+}
+
+func (b *genericBuilder[T]) Reserve(addRows int, _ int) {
+	if addRows <= 0 {
+		return
+	}
+	b.data = slices.Grow(b.data, addRows)
+	b.valid.Reserve(addRows)
 }
 
 func (b *genericBuilder[T]) Append(raw string, row int) error {
 	var zero T
 	b.data = append(b.data, zero)
-	if _, ok := b.nulls[raw]; ok {
+	if b.nulls.IsNull(raw) {
 		b.valid.Append(false)
 		return nil
 	}
@@ -68,11 +110,21 @@ type utf8Builder struct {
 	offsets []int32
 	bytes   []byte
 	valid   bitmapBuilder
-	nulls   map[string]struct{}
+	nulls   nullMatcher
+}
+
+func (b *utf8Builder) Reserve(addRows int, addBytes int) {
+	if addRows > 0 {
+		b.offsets = slices.Grow(b.offsets, addRows)
+		b.valid.Reserve(addRows)
+	}
+	if addBytes > 0 {
+		b.bytes = slices.Grow(b.bytes, addBytes)
+	}
 }
 
 func (b *utf8Builder) Append(raw string, _ int) error {
-	if _, ok := b.nulls[raw]; ok {
+	if b.nulls.IsNull(raw) {
 		b.valid.Append(false)
 		b.offsets = append(b.offsets, int32(len(b.bytes)))
 		return nil
@@ -126,10 +178,7 @@ func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error
 	}
 	header = append([]string(nil), header...)
 
-	nulls := make(map[string]struct{}, len(opts.NullValues))
-	for i := range opts.NullValues {
-		nulls[opts.NullValues[i]] = struct{}{}
-	}
+	nulls := newNullMatcher(opts.NullValues)
 
 	headerIdx := make(map[string]int, len(header))
 	for i := range header {
@@ -197,8 +246,9 @@ func readCSV(path string, opts ScanOptions, plan csvReadPlan) (*DataFrame, error
 	}
 
 	builders := make([]typedBuilder, len(included))
+	seedRows := len(records) + csvChunkRows
 	for i := range included {
-		builders[i] = newBuilder(dtypes[i], nulls)
+		builders[i] = newBuilder(dtypes[i], nulls, seedRows)
 	}
 
 	row := 1
@@ -227,7 +277,7 @@ type parseJob struct {
 	rows  [][]string
 }
 
-func parseRemainingCSVParallel(r *csv.Reader, header []string, included []int, filterIdx int, nulls map[string]struct{}, dtypes []DType, builders []typedBuilder, startRow int) error {
+func parseRemainingCSVParallel(r *csv.Reader, header []string, included []int, filterIdx int, nulls nullMatcher, dtypes []DType, builders []typedBuilder, startRow int) error {
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
 		return parseRemainingCSVSequential(r, header, included, filterIdx, nulls, builders, startRow)
@@ -245,6 +295,7 @@ func parseRemainingCSVParallel(r *csv.Reader, header []string, included []int, f
 		if err != nil {
 			return err
 		}
+		reserveForMerge(builders, results)
 		for _, res := range results {
 			for j := range builders {
 				if err := builders[j].AppendBuilder(res[j]); err != nil {
@@ -302,7 +353,7 @@ func parseRemainingCSVParallel(r *csv.Reader, header []string, included []int, f
 	return nil
 }
 
-func parseBatch(batch []parseJob, dtypes []DType, nulls map[string]struct{}, startRow int) ([][]typedBuilder, error) {
+func parseBatch(batch []parseJob, dtypes []DType, nulls nullMatcher, startRow int) ([][]typedBuilder, error) {
 	results := make([][]typedBuilder, len(batch))
 	errCh := make(chan error, len(batch))
 	var wg sync.WaitGroup
@@ -312,8 +363,9 @@ func parseBatch(batch []parseJob, dtypes []DType, nulls map[string]struct{}, sta
 			defer wg.Done()
 			job := batch[i]
 			local := make([]typedBuilder, len(dtypes))
+			rowsCap := len(job.rows)
 			for j := range dtypes {
-				local[j] = newBuilder(dtypes[j], nulls)
+				local[j] = newBuilder(dtypes[j], nulls, rowsCap)
 			}
 			row := startRow + job.index*csvChunkRows
 			for r := range job.rows {
@@ -335,7 +387,7 @@ func parseBatch(batch []parseJob, dtypes []DType, nulls map[string]struct{}, sta
 	return results, nil
 }
 
-func parseRemainingCSVSequential(r *csv.Reader, header []string, included []int, filterIdx int, nulls map[string]struct{}, builders []typedBuilder, row int) error {
+func parseRemainingCSVSequential(r *csv.Reader, header []string, included []int, filterIdx int, nulls nullMatcher, builders []typedBuilder, row int) error {
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -360,11 +412,39 @@ func parseRemainingCSVSequential(r *csv.Reader, header []string, included []int,
 	return nil
 }
 
-func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
+func reserveForMerge(dst []typedBuilder, batch [][]typedBuilder) {
+	rows := make([]int, len(dst))
+	bytes := make([]int, len(dst))
+	for i := range batch {
+		for j := range batch[i] {
+			switch b := batch[i][j].(type) {
+			case *utf8Builder:
+				rows[j] += len(b.offsets) - 1
+				bytes[j] += len(b.bytes)
+			case *genericBuilder[int64]:
+				rows[j] += len(b.data)
+			case *genericBuilder[float64]:
+				rows[j] += len(b.data)
+			case *genericBuilder[bool]:
+				rows[j] += len(b.data)
+			}
+		}
+	}
+	for j := range dst {
+		if rb, ok := dst[j].(reservableBuilder); ok {
+			rb.Reserve(rows[j], bytes[j])
+		}
+	}
+}
+
+func newBuilder(dtype DType, nulls nullMatcher, rowsCap int) typedBuilder {
+	if rowsCap < 16 {
+		rowsCap = 16
+	}
 	switch dtype {
 	case DTypeInt64:
 		return &genericBuilder[int64]{
-			data:  make([]int64, 0, 16384),
+			data:  make([]int64, 0, rowsCap),
 			nulls: nulls,
 			parse: func(raw string) (int64, error) {
 				return strconv.ParseInt(raw, 10, 64)
@@ -375,7 +455,7 @@ func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
 		}
 	case DTypeFloat64:
 		return &genericBuilder[float64]{
-			data:  make([]float64, 0, 16384),
+			data:  make([]float64, 0, rowsCap),
 			nulls: nulls,
 			parse: func(raw string) (float64, error) {
 				return strconv.ParseFloat(raw, 64)
@@ -386,7 +466,7 @@ func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
 		}
 	case DTypeBool:
 		return &genericBuilder[bool]{
-			data:  make([]bool, 0, 16384),
+			data:  make([]bool, 0, rowsCap),
 			nulls: nulls,
 			parse: func(raw string) (bool, error) {
 				return strconv.ParseBool(strings.ToLower(raw))
@@ -396,20 +476,24 @@ func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
 			},
 		}
 	default:
+		byteCap := rowsCap * 16
+		if byteCap < 256 {
+			byteCap = 256
+		}
 		return &utf8Builder{
-			offsets: make([]int32, 1, 16385),
-			bytes:   make([]byte, 0, 131072),
+			offsets: make([]int32, 1, rowsCap+1),
+			bytes:   make([]byte, 0, byteCap),
 			nulls:   nulls,
 		}
 	}
 }
 
-func inferType(values []string, nullSet map[string]struct{}) DType {
+func inferType(values []string, nullSet nullMatcher) DType {
 	allInt := true
 	allFloat := true
 	allBool := true
 	for i := range values {
-		if _, ok := nullSet[values[i]]; ok {
+		if nullSet.IsNull(values[i]) {
 			continue
 		}
 		if _, err := strconv.ParseInt(values[i], 10, 64); err != nil {
@@ -437,12 +521,32 @@ func inferType(values []string, nullSet map[string]struct{}) DType {
 	return DTypeUtf8
 }
 
-func rawEven(raw string, nulls map[string]struct{}) bool {
-	if _, ok := nulls[raw]; ok {
+func rawEven(raw string, nulls nullMatcher) bool {
+	if nulls.IsNull(raw) {
 		return false
 	}
-	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		return n%2 == 0
+	if even, ok := fastIntEven(raw); ok {
+		return even
 	}
 	return len(raw)%2 == 0
+}
+
+func fastIntEven(raw string) (bool, bool) {
+	if raw == "" {
+		return false, false
+	}
+	i := 0
+	if raw[0] == '-' || raw[0] == '+' {
+		if len(raw) == 1 {
+			return false, false
+		}
+		i = 1
+	}
+	for ; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false, false
+		}
+	}
+	last := raw[len(raw)-1]
+	return (last-'0')%2 == 0, true
 }

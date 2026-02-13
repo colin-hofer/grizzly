@@ -110,30 +110,14 @@ func (df *DataFrame) SortBy(column string, desc bool) (*DataFrame, error) {
 		}
 	case *Utf8Column:
 		cmp = func(a, b int) int {
-			ord := 0
-			if col.Less(a, b) {
-				ord = -1
-			} else if col.Less(b, a) {
-				ord = 1
-			}
+			ord := col.compareRows(a, b)
 			if desc {
 				ord = -ord
 			}
 			return compareNullAware(col.IsNull(a), col.IsNull(b), ord)
 		}
 	default:
-		cmp = func(a, b int) int {
-			ord := 0
-			if c.Less(a, b) {
-				ord = -1
-			} else if c.Less(b, a) {
-				ord = 1
-			}
-			if desc {
-				ord = -ord
-			}
-			return compareNullAware(c.IsNull(a), c.IsNull(b), ord)
-		}
+		return nil, fmt.Errorf("unsupported sort dtype %s", c.DType())
 	}
 	if df.nrows >= parallelSortThreshold && runtime.GOMAXPROCS(0) > 1 {
 		parallelStableSort(order, cmp)
@@ -161,12 +145,34 @@ func (df *DataFrame) ProjectionChecksum(maxCols int) string {
 		maxCols = len(df.columns)
 	}
 	h := sha256.New()
+	views := buildColumnViews(df.columns[:maxCols])
+	var numScratch [64]byte
 	for i := 0; i < df.nrows; i++ {
-		for j := 0; j < maxCols; j++ {
+		for j := range views {
 			if j > 0 {
 				hashWriteByte(h, 0x1f)
 			}
-			hashWriteString(h, df.columns[j].ValueString(i))
+			v := views[j]
+			if v.isNull(i) {
+				continue
+			}
+			switch v.kind {
+			case colKindInt64:
+				b := strconv.AppendInt(numScratch[:0], v.i64.Value(i), 10)
+				_, _ = h.Write(b)
+			case colKindFloat64:
+				b := strconv.AppendFloat(numScratch[:0], v.f64.Value(i), 'g', -1, 64)
+				_, _ = h.Write(b)
+			case colKindBool:
+				if v.b.Value(i) {
+					hashWriteString(h, "true")
+				} else {
+					hashWriteString(h, "false")
+				}
+			case colKindUtf8:
+				s, e := v.s.byteRange(i)
+				_, _ = h.Write(v.s.bytes[s:e])
+			}
 		}
 		hashWriteByte(h, '\n')
 	}
@@ -175,37 +181,42 @@ func (df *DataFrame) ProjectionChecksum(maxCols int) string {
 
 func (df *DataFrame) MarshalRowsJSON() ([]byte, error) {
 	var buf bytes.Buffer
+	quotedKeys := make([]string, len(df.columns))
+	views := buildColumnViews(df.columns)
+	for i := range df.columns {
+		quotedKeys[i] = strconv.Quote(df.columns[i].Name())
+	}
 	buf.WriteByte('[')
 	for i := 0; i < df.nrows; i++ {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
 		buf.WriteByte('{')
-		for j, c := range df.columns {
+		for j := range df.columns {
 			if j > 0 {
 				buf.WriteByte(',')
 			}
-			buf.WriteString(strconv.Quote(c.Name()))
+			buf.WriteString(quotedKeys[j])
 			buf.WriteByte(':')
-			if c.IsNull(i) {
+			v := views[j]
+			if v.isNull(i) {
 				buf.WriteString("null")
 				continue
 			}
-			switch cc := c.(type) {
-			case *Int64Column:
-				buf.WriteString(strconv.FormatInt(cc.Value(i), 10))
-			case *Float64Column:
-				buf.WriteString(strconv.FormatFloat(cc.Value(i), 'g', -1, 64))
-			case *BoolColumn:
-				if cc.Value(i) {
+			switch v.kind {
+			case colKindInt64:
+				buf.WriteString(strconv.FormatInt(v.i64.Value(i), 10))
+			case colKindFloat64:
+				buf.WriteString(strconv.FormatFloat(v.f64.Value(i), 'g', -1, 64))
+			case colKindBool:
+				if v.b.Value(i) {
 					buf.WriteString("true")
 				} else {
 					buf.WriteString("false")
 				}
-			case *Utf8Column:
-				buf.WriteString(strconv.Quote(cc.Value(i)))
-			default:
-				buf.WriteString(strconv.Quote(c.ValueString(i)))
+			case colKindUtf8:
+				s, e := v.s.byteRange(i)
+				writeJSONStringEscapedBytes(&buf, v.s.bytes[s:e])
 			}
 		}
 		buf.WriteByte('}')
@@ -222,6 +233,83 @@ func hashWriteByte(h hash.Hash, b byte) {
 	var one [1]byte
 	one[0] = b
 	_, _ = h.Write(one[:])
+}
+
+type columnKind uint8
+
+const (
+	colKindInt64 columnKind = iota + 1
+	colKindFloat64
+	colKindBool
+	colKindUtf8
+)
+
+type columnView struct {
+	kind columnKind
+	i64  *Int64Column
+	f64  *Float64Column
+	b    *BoolColumn
+	s    *Utf8Column
+}
+
+func (v columnView) isNull(i int) bool {
+	switch v.kind {
+	case colKindInt64:
+		return v.i64.IsNull(i)
+	case colKindFloat64:
+		return v.f64.IsNull(i)
+	case colKindBool:
+		return v.b.IsNull(i)
+	default:
+		return v.s.IsNull(i)
+	}
+}
+
+func buildColumnViews(cols []Column) []columnView {
+	out := make([]columnView, len(cols))
+	for i := range cols {
+		switch c := cols[i].(type) {
+		case *Int64Column:
+			out[i] = columnView{kind: colKindInt64, i64: c}
+		case *Float64Column:
+			out[i] = columnView{kind: colKindFloat64, f64: c}
+		case *BoolColumn:
+			out[i] = columnView{kind: colKindBool, b: c}
+		case *Utf8Column:
+			out[i] = columnView{kind: colKindUtf8, s: c}
+		default:
+			panic("unsupported column type")
+		}
+	}
+	return out
+}
+
+func writeJSONStringEscapedBytes(buf *bytes.Buffer, b []byte) {
+	buf.WriteByte('"')
+	for _, c := range b {
+		switch c {
+		case '\\':
+			buf.WriteString("\\\\")
+		case '"':
+			buf.WriteString("\\\"")
+		case '\n':
+			buf.WriteString("\\n")
+		case '\r':
+			buf.WriteString("\\r")
+		case '\t':
+			buf.WriteString("\\t")
+		default:
+			if c < 0x20 {
+				buf.WriteString("\\u00")
+				hex := "0123456789abcdef"
+				buf.WriteByte(hex[c>>4])
+				buf.WriteByte(hex[c&0x0f])
+			} else {
+				buf.WriteByte(c)
+			}
+		}
+	}
+	buf.WriteByte('"')
 }
 
 func compareNullAware(aNull, bNull bool, ord int) int {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 )
 
 func readJSON(path string) (*DataFrame, error) {
@@ -66,8 +67,9 @@ func recordsToFrame(rows []map[string]any) (*DataFrame, error) {
 	for k := range keySet {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 	cols := make([]Column, 0, len(keys))
-	nullSet := map[string]struct{}{"": {}}
+	nullSet := newNullMatcher([]string{""})
 	for _, key := range keys {
 		raw := make([]string, 0, len(rows))
 		for i := range rows {
@@ -78,7 +80,7 @@ func recordsToFrame(rows []map[string]any) (*DataFrame, error) {
 			}
 			raw = append(raw, fmt.Sprint(v))
 		}
-		b := newBuilder(inferType(raw, nullSet), nullSet)
+		b := newBuilder(inferType(raw, nullSet), nullSet, len(raw))
 		for i := range raw {
 			if err := b.Append(raw[i], i+1); err != nil {
 				return nil, err

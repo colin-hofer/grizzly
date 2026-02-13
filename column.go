@@ -13,13 +13,11 @@ type Column interface {
 	ValueString(i int) string
 	Filter(mask []bool) Column
 	Take(order []int) Column
-	Less(i, j int) bool
 }
 
 type typeOps[T any] struct {
 	dtype    DType
 	toString func(T) string
-	less     func(a, b T) bool
 }
 
 type typedColumn[T any] struct {
@@ -34,9 +32,6 @@ func (c *typedColumn[T]) Name() string      { return c.name }
 func (c *typedColumn[T]) DType() DType      { return c.ops.dtype }
 func (c *typedColumn[T]) Len() int          { return len(c.data) }
 func (c *typedColumn[T]) IsNull(i int) bool { return !c.valid.get(i) }
-func (c *typedColumn[T]) Less(i, j int) bool {
-	return c.ops.less(c.data[i], c.data[j])
-}
 func (c *typedColumn[T]) ValueString(i int) string {
 	if c.IsNull(i) {
 		return ""
@@ -118,10 +113,10 @@ func (c *Utf8Column) ValueString(i int) string {
 	}
 	return c.Value(i)
 }
-func (c *Utf8Column) Less(i, j int) bool {
+func (c *Utf8Column) compareRows(i, j int) int {
 	is, ie := c.byteRange(i)
 	js, je := c.byteRange(j)
-	return bytes.Compare(c.bytes[is:ie], c.bytes[js:je]) < 0
+	return bytes.Compare(c.bytes[is:ie], c.bytes[js:je])
 }
 func (c *Utf8Column) compareLiteral(i int, lit []byte) int {
 	s, e := c.byteRange(i)
@@ -227,6 +222,10 @@ func newBoolColumnOwned(name string, data []bool, valid bitmap) Column {
 	return &BoolColumn{typedColumn[bool]{name: name, data: data, valid: valid, ops: boolOps, build: newBoolColumnOwned}}
 }
 
+func newBoolColumnOwnedFromMask(name string, data []bool, valid []bool) *BoolColumn {
+	return &BoolColumn{typedColumn[bool]{name: name, data: data, valid: newBitmapFromBools(valid), ops: boolOps, build: newBoolColumnOwned}}
+}
+
 func newUtf8ColumnOwned(name string, offsets []int32, bytes []byte, valid bitmap) Column {
 	return &Utf8Column{name: name, offsets: offsets, bytes: bytes, valid: valid}
 }
@@ -234,13 +233,11 @@ func newUtf8ColumnOwned(name string, offsets []int32, bytes []byte, valid bitmap
 var int64Ops = typeOps[int64]{
 	dtype:    DTypeInt64,
 	toString: func(v int64) string { return strconv.FormatInt(v, 10) },
-	less:     func(a, b int64) bool { return a < b },
 }
 
 var float64Ops = typeOps[float64]{
 	dtype:    DTypeFloat64,
 	toString: func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) },
-	less:     func(a, b float64) bool { return a < b },
 }
 
 var boolOps = typeOps[bool]{
@@ -251,5 +248,4 @@ var boolOps = typeOps[bool]{
 		}
 		return "false"
 	},
-	less: func(a, b bool) bool { return !a && b },
 }

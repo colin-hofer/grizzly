@@ -42,57 +42,73 @@ func (e compareExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 	}
 	vals := make([]bool, col.Len())
 	valid := make([]bool, col.Len())
-	var utf8Lit []byte
-	if _, ok := col.(*Utf8Column); ok {
-		utf8Lit = []byte(fmt.Sprint(e.right))
-	}
-	for i := range vals {
-		if col.IsNull(i) {
-			continue
+	switch c := col.(type) {
+	case *Int64Column:
+		r, ok := literalToInt64(e.right)
+		if !ok {
+			return nil, fmt.Errorf("cannot compare int64 column with literal")
 		}
-		valid[i] = true
-		switch c := col.(type) {
-		case *Int64Column:
-			r, ok := literalToInt64(e.right)
-			if !ok {
-				return nil, fmt.Errorf("cannot compare int64 column with literal")
+		for i := range vals {
+			if c.IsNull(i) {
+				continue
 			}
+			valid[i] = true
 			if e.op == "eq" {
 				vals[i] = c.Value(i) == r
 			} else {
 				vals[i] = c.Value(i) > r
 			}
-		case *Float64Column:
-			r, ok := literalToFloat64(e.right)
-			if !ok {
-				return nil, fmt.Errorf("cannot compare float64 column with literal")
+		}
+	case *Float64Column:
+		r, ok := literalToFloat64(e.right)
+		if !ok {
+			return nil, fmt.Errorf("cannot compare float64 column with literal")
+		}
+		for i := range vals {
+			if c.IsNull(i) {
+				continue
 			}
+			valid[i] = true
 			if e.op == "eq" {
 				vals[i] = c.Value(i) == r
 			} else {
 				vals[i] = c.Value(i) > r
 			}
-		case *Utf8Column:
+		}
+	case *Utf8Column:
+		lit := []byte(fmt.Sprint(e.right))
+		for i := range vals {
+			if c.IsNull(i) {
+				continue
+			}
+			valid[i] = true
+			cmp := c.compareLiteral(i, lit)
 			if e.op == "eq" {
-				vals[i] = c.compareLiteral(i, utf8Lit) == 0
+				vals[i] = cmp == 0
 			} else {
-				vals[i] = c.compareLiteral(i, utf8Lit) > 0
+				vals[i] = cmp > 0
 			}
-		case *BoolColumn:
-			r, ok := e.right.(bool)
-			if !ok {
-				return nil, fmt.Errorf("bool comparison requires bool literal")
+		}
+	case *BoolColumn:
+		r, ok := e.right.(bool)
+		if !ok {
+			return nil, fmt.Errorf("bool comparison requires bool literal")
+		}
+		for i := range vals {
+			if c.IsNull(i) {
+				continue
 			}
+			valid[i] = true
 			if e.op == "eq" {
 				vals[i] = c.Value(i) == r
 			} else {
 				vals[i] = c.Value(i) && !r
 			}
-		default:
-			return nil, fmt.Errorf("unsupported compare column type")
 		}
+	default:
+		return nil, fmt.Errorf("unsupported compare column type")
 	}
-	return NewBoolColumn("_mask", vals, valid), nil
+	return newBoolColumnOwnedFromMask("_mask", vals, valid), nil
 }
 
 type evenExpr struct {
@@ -124,7 +140,7 @@ func (e evenExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 			vals[i] = false
 		}
 	}
-	return NewBoolColumn("_mask", vals, valid), nil
+	return newBoolColumnOwnedFromMask("_mask", vals, valid), nil
 }
 
 type logicalExpr struct {
@@ -161,7 +177,7 @@ func (e logicalExpr) Eval(df *DataFrame) (*BoolColumn, error) {
 			out[i] = la.Value(i) || lb.Value(i)
 		}
 	}
-	return NewBoolColumn("_mask", out, valid), nil
+	return newBoolColumnOwnedFromMask("_mask", out, valid), nil
 }
 
 func literalToInt64(v any) (int64, bool) {

@@ -19,6 +19,8 @@
 - Sort uses type-specialized kernels and parallel stable merge-sort for large frames
 - JSON serialization writes rows directly to an output buffer, avoiding map-heavy intermediate structures
 - UTF-8 columns are stored as offset+byte buffers, reducing string-object overhead
+- Expression literals are parsed once per kernel and evaluated with typed loops
+- JSON record ingestion normalizes and sorts keys for deterministic column ordering
 
 ## Quick Example
 

@@ -63,7 +63,35 @@ func (b *bitmapBuilder) Get(i int) bool {
 }
 
 func (b *bitmapBuilder) AppendFrom(other *bitmapBuilder) {
+	if other.n == 0 {
+		return
+	}
+	if b.n%64 == 0 {
+		full := other.n / 64
+		if full > 0 {
+			b.bits = append(b.bits, other.bits[:full]...)
+			b.n += full * 64
+		}
+		for i := full * 64; i < other.n; i++ {
+			b.Append(other.Get(i))
+		}
+		return
+	}
 	for i := 0; i < other.n; i++ {
 		b.Append(other.Get(i))
 	}
+}
+
+func (b *bitmapBuilder) Reserve(additionalBits int) {
+	if additionalBits <= 0 {
+		return
+	}
+	needBits := b.n + additionalBits
+	needWords := (needBits + 63) / 64
+	if cap(b.bits) >= needWords {
+		return
+	}
+	next := make([]uint64, len(b.bits), needWords)
+	copy(next, b.bits)
+	b.bits = next
 }
