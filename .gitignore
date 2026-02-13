@@ -1,0 +1,24 @@
+# Build output
+build/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Dependencies
+vendor/
+
+# OS files
+Thumbs.db
+
+# Test files
+testdata/
