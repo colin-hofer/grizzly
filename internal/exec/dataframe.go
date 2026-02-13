@@ -1,4 +1,4 @@
-package grizzly
+package exec
 
 import (
 	"bytes"
@@ -12,22 +12,27 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+
+	"grizzly/internal/array"
+	"grizzly/internal/expr"
 )
 
 const parallelSortThreshold = 250000
 
 type DataFrame struct {
-	columns []Column
+	columns []array.Column
 	index   map[string]int
 	nrows   int
+	schema  array.Schema
 }
 
-func NewDataFrame(cols ...Column) (*DataFrame, error) {
+func NewDataFrame(cols ...array.Column) (*DataFrame, error) {
 	if len(cols) == 0 {
 		return nil, fmt.Errorf("at least one column required")
 	}
 	n := cols[0].Len()
 	idx := make(map[string]int, len(cols))
+	fields := make([]array.Field, len(cols))
 	for i := range cols {
 		if cols[i].Len() != n {
 			return nil, fmt.Errorf("column %s has mismatched length", cols[i].Name())
@@ -36,20 +41,26 @@ func NewDataFrame(cols ...Column) (*DataFrame, error) {
 			return nil, fmt.Errorf("duplicate column %s", cols[i].Name())
 		}
 		idx[cols[i].Name()] = i
+		fields[i] = array.Field{Name: cols[i].Name(), Type: cols[i].DType()}
 	}
-	return &DataFrame{columns: cols, index: idx, nrows: n}, nil
+	schema, err := array.NewSchema(fields)
+	if err != nil {
+		return nil, err
+	}
+	return &DataFrame{columns: cols, index: idx, nrows: n, schema: schema}, nil
 }
 
-func (df *DataFrame) Height() int { return df.nrows }
-func (df *DataFrame) Width() int  { return len(df.columns) }
+func (df *DataFrame) Height() int          { return df.nrows }
+func (df *DataFrame) Width() int           { return len(df.columns) }
+func (df *DataFrame) Schema() array.Schema { return df.schema }
 
-func (df *DataFrame) Columns() []Column {
-	out := make([]Column, len(df.columns))
+func (df *DataFrame) Columns() []array.Column {
+	out := make([]array.Column, len(df.columns))
 	copy(out, df.columns)
 	return out
 }
 
-func (df *DataFrame) Column(name string) (Column, bool) {
+func (df *DataFrame) Column(name string) (array.Column, bool) {
 	i, ok := df.index[name]
 	if !ok {
 		return nil, false
@@ -58,7 +69,7 @@ func (df *DataFrame) Column(name string) (Column, bool) {
 }
 
 func (df *DataFrame) Select(names ...string) (*DataFrame, error) {
-	cols := make([]Column, 0, len(names))
+	cols := make([]array.Column, 0, len(names))
 	for _, name := range names {
 		c, ok := df.Column(name)
 		if !ok {
@@ -69,20 +80,162 @@ func (df *DataFrame) Select(names ...string) (*DataFrame, error) {
 	return NewDataFrame(cols...)
 }
 
-func (df *DataFrame) Filter(expr Expr) (*DataFrame, error) {
-	mask, err := expr.Eval(df)
+func (df *DataFrame) Filter(e expr.Expr) (*DataFrame, error) {
+	mask, err := e.Eval(df)
 	if err != nil {
 		return nil, err
 	}
-	if mask.Len() != df.nrows {
+	if len(mask.Data) != df.nrows {
 		return nil, fmt.Errorf("mask length mismatch")
 	}
-	vals := mask.data
-	cols := make([]Column, len(df.columns))
+	vals := mask.Data
+	cols := make([]array.Column, len(df.columns))
 	for i := range df.columns {
 		cols[i] = df.columns[i].Filter(vals)
 	}
 	return NewDataFrame(cols...)
+}
+
+func (df *DataFrame) Slice(offset, length int) (*DataFrame, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("slice offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("slice length must be >= 0")
+	}
+	if offset >= df.nrows || length == 0 {
+		order := []int{}
+		cols := make([]array.Column, len(df.columns))
+		for i := range cols {
+			cols[i] = df.columns[i].Take(order)
+		}
+		return NewDataFrame(cols...)
+	}
+	end := offset + length
+	if end > df.nrows {
+		end = df.nrows
+	}
+	order := make([]int, end-offset)
+	for i := range order {
+		order[i] = offset + i
+	}
+	cols := make([]array.Column, len(df.columns))
+	for i := range cols {
+		cols[i] = df.columns[i].Take(order)
+	}
+	return NewDataFrame(cols...)
+}
+
+func (df *DataFrame) Head(n int) (*DataFrame, error) {
+	if n < 0 {
+		return nil, fmt.Errorf("head n must be >= 0")
+	}
+	if n > df.nrows {
+		n = df.nrows
+	}
+	return df.Slice(0, n)
+}
+
+func (df *DataFrame) Tail(n int) (*DataFrame, error) {
+	if n < 0 {
+		return nil, fmt.Errorf("tail n must be >= 0")
+	}
+	if n > df.nrows {
+		n = df.nrows
+	}
+	return df.Slice(df.nrows-n, n)
+}
+
+func (df *DataFrame) Limit(n int) (*DataFrame, error) {
+	return df.Head(n)
+}
+
+func (df *DataFrame) Drop(names ...string) (*DataFrame, error) {
+	if len(names) == 0 {
+		return df, nil
+	}
+	drop := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			return nil, fmt.Errorf("drop requires non-empty column name")
+		}
+		if _, ok := df.index[name]; !ok {
+			return nil, fmt.Errorf("unknown column %s", name)
+		}
+		drop[name] = struct{}{}
+	}
+	kept := make([]array.Column, 0, len(df.columns))
+	for i := range df.columns {
+		if _, ok := drop[df.columns[i].Name()]; ok {
+			continue
+		}
+		kept = append(kept, df.columns[i])
+	}
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("cannot drop all columns")
+	}
+	return NewDataFrame(kept...)
+}
+
+func (df *DataFrame) Rename(oldName, newName string) (*DataFrame, error) {
+	if oldName == "" || newName == "" {
+		return nil, fmt.Errorf("rename requires non-empty names")
+	}
+	idx, ok := df.index[oldName]
+	if !ok {
+		return nil, fmt.Errorf("unknown column %s", oldName)
+	}
+	if oldName == newName {
+		return df, nil
+	}
+	if _, exists := df.index[newName]; exists {
+		return nil, fmt.Errorf("duplicate column %s", newName)
+	}
+	renamed, err := array.WithName(df.columns[idx], newName)
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]array.Column, len(df.columns))
+	copy(cols, df.columns)
+	cols[idx] = renamed
+	return NewDataFrame(cols...)
+}
+
+func (df *DataFrame) WithColumns(cols ...array.Column) (*DataFrame, error) {
+	if len(cols) == 0 {
+		return df, nil
+	}
+	out := make([]array.Column, len(df.columns))
+	copy(out, df.columns)
+	idx := make(map[string]int, len(df.columns))
+	for i := range out {
+		idx[out[i].Name()] = i
+	}
+	seen := make(map[string]struct{}, len(cols))
+	for i := range cols {
+		c := cols[i]
+		if c == nil {
+			return nil, fmt.Errorf("nil column")
+		}
+		name := c.Name()
+		if name == "" {
+			return nil, fmt.Errorf("column name required")
+		}
+		if _, ok := seen[name]; ok {
+			return nil, fmt.Errorf("duplicate input column %s", name)
+		}
+		seen[name] = struct{}{}
+		if c.Len() != df.nrows {
+			return nil, fmt.Errorf("column %s has mismatched length", name)
+		}
+		if j, ok := idx[name]; ok {
+			out[j] = c
+		} else {
+			idx[name] = len(out)
+			out = append(out, c)
+		}
+	}
+	return NewDataFrame(out...)
 }
 
 func (df *DataFrame) SortBy(column string, desc bool) (*DataFrame, error) {
@@ -96,21 +249,21 @@ func (df *DataFrame) SortBy(column string, desc bool) (*DataFrame, error) {
 	}
 	var cmp func(a, b int) int
 	switch col := c.(type) {
-	case *Int64Column:
+	case *array.Int64Column:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareInt64(col.data[a], col.data[b], desc))
+			return compareNullAware(col.IsNull(a), col.IsNull(b), compareInt64(col.Value(a), col.Value(b), desc))
 		}
-	case *Float64Column:
+	case *array.Float64Column:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareFloat64(col.data[a], col.data[b], desc))
+			return compareNullAware(col.IsNull(a), col.IsNull(b), compareFloat64(col.Value(a), col.Value(b), desc))
 		}
-	case *BoolColumn:
+	case *array.BoolColumn:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareBool(col.data[a], col.data[b], desc))
+			return compareNullAware(col.IsNull(a), col.IsNull(b), compareBool(col.Value(a), col.Value(b), desc))
 		}
-	case *Utf8Column:
+	case *array.Utf8Column:
 		cmp = func(a, b int) int {
-			ord := col.compareRows(a, b)
+			ord := col.CompareRows(a, b)
 			if desc {
 				ord = -ord
 			}
@@ -130,7 +283,7 @@ func (df *DataFrame) SortBy(column string, desc bool) (*DataFrame, error) {
 			return o < 0
 		})
 	}
-	cols := make([]Column, len(df.columns))
+	cols := make([]array.Column, len(df.columns))
 	for i := range df.columns {
 		cols[i] = df.columns[i].Take(order)
 	}
@@ -170,8 +323,8 @@ func (df *DataFrame) ProjectionChecksum(maxCols int) string {
 					hashWriteString(h, "false")
 				}
 			case colKindUtf8:
-				s, e := v.s.byteRange(i)
-				_, _ = h.Write(v.s.bytes[s:e])
+				s, e := v.s.ByteRange(i)
+				_, _ = h.Write(v.s.Bytes()[s:e])
 			}
 		}
 		hashWriteByte(h, '\n')
@@ -215,8 +368,8 @@ func (df *DataFrame) MarshalRowsJSON() ([]byte, error) {
 					buf.WriteString("false")
 				}
 			case colKindUtf8:
-				s, e := v.s.byteRange(i)
-				writeJSONStringEscapedBytes(&buf, v.s.bytes[s:e])
+				s, e := v.s.ByteRange(i)
+				writeJSONStringEscapedBytes(&buf, v.s.Bytes()[s:e])
 			}
 		}
 		buf.WriteByte('}')
@@ -244,12 +397,18 @@ const (
 	colKindUtf8
 )
 
+type utf8View interface {
+	ByteRange(i int) (int, int)
+	Bytes() []byte
+	IsNull(i int) bool
+}
+
 type columnView struct {
 	kind columnKind
-	i64  *Int64Column
-	f64  *Float64Column
-	b    *BoolColumn
-	s    *Utf8Column
+	i64  *array.Int64Column
+	f64  *array.Float64Column
+	b    *array.BoolColumn
+	s    *array.Utf8Column
 }
 
 func (v columnView) isNull(i int) bool {
@@ -265,17 +424,17 @@ func (v columnView) isNull(i int) bool {
 	}
 }
 
-func buildColumnViews(cols []Column) []columnView {
+func buildColumnViews(cols []array.Column) []columnView {
 	out := make([]columnView, len(cols))
 	for i := range cols {
 		switch c := cols[i].(type) {
-		case *Int64Column:
+		case *array.Int64Column:
 			out[i] = columnView{kind: colKindInt64, i64: c}
-		case *Float64Column:
+		case *array.Float64Column:
 			out[i] = columnView{kind: colKindFloat64, f64: c}
-		case *BoolColumn:
+		case *array.BoolColumn:
 			out[i] = columnView{kind: colKindBool, b: c}
-		case *Utf8Column:
+		case *array.Utf8Column:
 			out[i] = columnView{kind: colKindUtf8, s: c}
 		default:
 			panic("unsupported column type")
