@@ -3,11 +3,11 @@ package grizzly
 import (
 	"context"
 	"fmt"
-
 	"grizzly/internal/array"
 	"grizzly/internal/exec"
 	"grizzly/internal/expr"
 	"grizzly/internal/plan"
+	"grizzly/internal/print"
 )
 
 // This package is the public API surface.
@@ -18,9 +18,11 @@ import (
 // - internal/plan: lazy plans + optimizer rules
 // - internal/exec: kernels and dataframe execution
 
-type Kind = array.Kind
-type TimeUnit = array.TimeUnit
-type DataType = array.DataType
+type (
+	Kind     = array.Kind
+	TimeUnit = array.TimeUnit
+	DataType = array.DataType
+)
 
 const (
 	KindInvalid  = array.KindInvalid
@@ -102,6 +104,7 @@ func (s Series) Int64() (*Int64Column, bool) {
 	}
 	return &Int64Column{col: c}, true
 }
+
 func (s Series) Float64() (*Float64Column, bool) {
 	c, ok := s.col.(*array.Float64Column)
 	if !ok {
@@ -109,6 +112,7 @@ func (s Series) Float64() (*Float64Column, bool) {
 	}
 	return &Float64Column{col: c}, true
 }
+
 func (s Series) Bool() (*BoolColumn, bool) {
 	c, ok := s.col.(*array.BoolColumn)
 	if !ok {
@@ -116,6 +120,7 @@ func (s Series) Bool() (*BoolColumn, bool) {
 	}
 	return &BoolColumn{col: c}, true
 }
+
 func (s Series) Utf8() (*Utf8Column, bool) {
 	c, ok := s.col.(*array.Utf8Column)
 	if !ok {
@@ -127,10 +132,12 @@ func (s Series) Utf8() (*Utf8Column, bool) {
 // Concrete column wrappers.
 //
 // These intentionally do not expose internal backing storage.
-type Int64Column struct{ col *array.Int64Column }
-type Float64Column struct{ col *array.Float64Column }
-type BoolColumn struct{ col *array.BoolColumn }
-type Utf8Column struct{ col *array.Utf8Column }
+type (
+	Int64Column   struct{ col *array.Int64Column }
+	Float64Column struct{ col *array.Float64Column }
+	BoolColumn    struct{ col *array.BoolColumn }
+	Utf8Column    struct{ col *array.Utf8Column }
+)
 
 func (c *Int64Column) internalColumn() array.Column   { return c.col }
 func (c *Float64Column) internalColumn() array.Column { return c.col }
@@ -172,6 +179,7 @@ func NewInt64Column(name string, data []int64, valid []bool) (*Int64Column, erro
 	}
 	return &Int64Column{col: c}, nil
 }
+
 func NewFloat64Column(name string, data []float64, valid []bool) (*Float64Column, error) {
 	c, err := array.NewFloat64Column(name, data, valid)
 	if err != nil {
@@ -179,6 +187,7 @@ func NewFloat64Column(name string, data []float64, valid []bool) (*Float64Column
 	}
 	return &Float64Column{col: c}, nil
 }
+
 func NewBoolColumn(name string, data []bool, valid []bool) (*BoolColumn, error) {
 	c, err := array.NewBoolColumn(name, data, valid)
 	if err != nil {
@@ -186,6 +195,7 @@ func NewBoolColumn(name string, data []bool, valid []bool) (*BoolColumn, error) 
 	}
 	return &BoolColumn{col: c}, nil
 }
+
 func NewUtf8Column(name string, data []string, valid []bool) (*Utf8Column, error) {
 	c, err := array.NewUtf8Column(name, data, valid)
 	if err != nil {
@@ -201,6 +211,7 @@ func MustNewInt64Column(name string, data []int64, valid []bool) *Int64Column {
 	}
 	return c
 }
+
 func MustNewFloat64Column(name string, data []float64, valid []bool) *Float64Column {
 	c, err := NewFloat64Column(name, data, valid)
 	if err != nil {
@@ -208,6 +219,7 @@ func MustNewFloat64Column(name string, data []float64, valid []bool) *Float64Col
 	}
 	return c
 }
+
 func MustNewBoolColumn(name string, data []bool, valid []bool) *BoolColumn {
 	c, err := NewBoolColumn(name, data, valid)
 	if err != nil {
@@ -215,6 +227,7 @@ func MustNewBoolColumn(name string, data []bool, valid []bool) *BoolColumn {
 	}
 	return c
 }
+
 func MustNewUtf8Column(name string, data []string, valid []bool) *Utf8Column {
 	c, err := NewUtf8Column(name, data, valid)
 	if err != nil {
@@ -257,6 +270,16 @@ func (df *DataFrame) Schema() Schema {
 		out[i] = Field{Name: s.Fields[i].Name, Type: s.Fields[i].Type}
 	}
 	return Schema{Fields: out}
+}
+
+// String formats the DataFrame as a readable ASCII table.
+// It intentionally prints only a preview (head/tail) for large dataframes.
+func (df *DataFrame) String() string {
+	return df.Table(print.DefaultTableOptions())
+}
+
+func (df *DataFrame) Table(opts print.TableOptions) string {
+	return print.Table(df.df, opts)
 }
 
 func (df *DataFrame) Columns() []Series {
@@ -449,6 +472,11 @@ type LazyFrame struct {
 	lf *plan.LazyFrame
 }
 
+type LazyGroupBy struct {
+	lf   *plan.LazyFrame
+	keys []string
+}
+
 func ScanCSV(path string, opts ScanOptions) *LazyFrame {
 	return &LazyFrame{lf: plan.ScanCSV(path, opts)}
 }
@@ -457,12 +485,31 @@ func ScanJSON(path string) *LazyFrame { return &LazyFrame{lf: plan.ScanJSON(path
 func (lf *LazyFrame) Select(cols ...string) *LazyFrame {
 	return &LazyFrame{lf: lf.lf.Select(cols...)}
 }
+
 func (lf *LazyFrame) Filter(e Expr) *LazyFrame {
 	return &LazyFrame{lf: lf.lf.Filter(e.internal())}
 }
+
 func (lf *LazyFrame) Sort(col string, desc bool) *LazyFrame {
 	return &LazyFrame{lf: lf.lf.Sort(col, desc)}
 }
+
+func (lf *LazyFrame) GroupBy(keys ...string) *LazyGroupBy {
+	return &LazyGroupBy{lf: lf.lf, keys: append([]string(nil), keys...)}
+}
+
+func (gb *LazyGroupBy) Agg(specs ...Agg) *LazyFrame {
+	internal := make([]exec.AggSpec, len(specs))
+	for i := range specs {
+		internal[i] = exec.AggSpec{Col: specs[i].Col, Func: specs[i].Func, Alias: specs[i].Alias}
+	}
+	return &LazyFrame{lf: gb.lf.GroupByAgg(gb.keys, internal)}
+}
+
+func (gb *LazyGroupBy) Count() *LazyFrame {
+	return gb.Agg(Count())
+}
+
 func (lf *LazyFrame) Collect() (*DataFrame, error) {
 	return lf.CollectContext(context.Background())
 }

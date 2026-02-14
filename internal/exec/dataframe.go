@@ -6,15 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"grizzly/internal/array"
+	"grizzly/internal/expr"
 	"hash"
 	"io"
 	"runtime"
 	"sort"
 	"strconv"
 	"sync"
-
-	"grizzly/internal/array"
-	"grizzly/internal/expr"
 )
 
 const parallelSortThreshold = 250000

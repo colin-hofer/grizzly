@@ -36,6 +36,7 @@ const (
 	opSelect opType = iota + 1
 	opFilter
 	opSort
+	opGroupByAgg
 )
 
 type op struct {
@@ -44,6 +45,8 @@ type op struct {
 	filter expr.Expr
 	sortBy string
 	desc   bool
+	gbKeys []string
+	aggs   []exec.AggSpec
 }
 
 type LazyFrame struct {
@@ -141,6 +144,19 @@ func formatOp(op op) string {
 		cols := expr.ExprColumns(op.filter)
 		sort.Strings(cols)
 		return "filter(cols=[" + strings.Join(cols, ",") + "])"
+	case opGroupByAgg:
+		keys := append([]string(nil), op.gbKeys...)
+		sort.Strings(keys)
+		out := make([]string, 0, len(op.aggs))
+		for i := range op.aggs {
+			alias := op.aggs[i].Alias
+			if alias == "" {
+				alias = "?"
+			}
+			out = append(out, alias)
+		}
+		sort.Strings(out)
+		return "groupby(keys=[" + strings.Join(keys, ",") + "] aggs=[" + strings.Join(out, ",") + "])"
 	default:
 		return "op(?)"
 	}
@@ -175,6 +191,15 @@ func (lf *LazyFrame) Sort(col string, desc bool) *LazyFrame {
 	return &next
 }
 
+func (lf *LazyFrame) GroupByAgg(keys []string, aggs []exec.AggSpec) *LazyFrame {
+	next := *lf
+	o := op{typeID: opGroupByAgg}
+	o.gbKeys = append([]string(nil), keys...)
+	o.aggs = append([]exec.AggSpec(nil), aggs...)
+	next.ops = append(append([]op(nil), lf.ops...), o)
+	return &next
+}
+
 func (lf *LazyFrame) Collect() (*exec.DataFrame, error) {
 	return lf.CollectContext(context.Background())
 }
@@ -203,6 +228,12 @@ func (lf *LazyFrame) CollectContext(ctx context.Context) (*exec.DataFrame, error
 				df, err = df.Select(op.cols...)
 			case opSort:
 				df, err = df.SortBy(op.sortBy, op.desc)
+			case opGroupByAgg:
+				var gb *exec.GroupBy
+				gb, err = df.GroupBy(op.gbKeys...)
+				if err == nil {
+					df, err = gb.Agg(op.aggs...)
+				}
 			}
 			if err != nil {
 				return nil, err
@@ -228,6 +259,12 @@ func (lf *LazyFrame) CollectContext(ctx context.Context) (*exec.DataFrame, error
 			df, err = df.Select(op.cols...)
 		case opSort:
 			df, err = df.SortBy(op.sortBy, op.desc)
+		case opGroupByAgg:
+			var gb *exec.GroupBy
+			gb, err = df.GroupBy(op.gbKeys...)
+			if err == nil {
+				df, err = gb.Agg(op.aggs...)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -248,6 +285,14 @@ func (lf *LazyFrame) optimize() *LazyFrame {
 func (lf *LazyFrame) csvReadPlan() (csvio.ReadPlan, []op, error) {
 	plan := csvio.ReadPlan{}
 	remaining := make([]op, 0, len(lf.ops))
+	for i := range lf.ops {
+		if lf.ops[i].typeID == opGroupByAgg {
+			// GroupBy changes the schema; keep planning simple for now: no pushdowns.
+			next := make([]op, len(lf.ops))
+			copy(next, lf.ops)
+			return plan, next, nil
+		}
+	}
 
 	var visible map[string]struct{}
 

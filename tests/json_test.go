@@ -1,10 +1,12 @@
-package grizzly
+package tests
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	g "grizzly"
 )
 
 func TestJSONKeyOrderDeterministic(t *testing.T) {
@@ -14,7 +16,7 @@ func TestJSONKeyOrderDeterministic(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	df, err := ScanJSON(p).Collect()
+	df, err := g.ScanJSON(p).Collect()
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -36,7 +38,7 @@ func TestScanJSONCollectContextCanceled(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := ScanJSON(p).CollectContext(ctx)
+	_, err := g.ScanJSON(p).CollectContext(ctx)
 	if err == nil {
 		t.Fatalf("expected cancellation error")
 	}

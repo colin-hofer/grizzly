@@ -1,9 +1,11 @@
-package grizzly
+package tests
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	g "grizzly"
 )
 
 func TestLazyDoesNotChangeSelectFilterSemantics(t *testing.T) {
@@ -14,7 +16,7 @@ func TestLazyDoesNotChangeSelectFilterSemantics(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	// Select drops column b; filtering by b should error.
-	_, err := ScanCSV(p, ScanOptions{}).Select("a").Filter(Col("b").Eq(10)).Collect()
+	_, err := g.ScanCSV(p, g.ScanOptions{}).Select("a").Filter(g.Col("b").Eq(10)).Collect()
 	if err == nil {
 		t.Fatalf("expected error")
 	}

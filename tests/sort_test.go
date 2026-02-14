@@ -1,9 +1,11 @@
-package grizzly
+package tests
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	g "grizzly"
 )
 
 func TestSortStableForEqualKeys(t *testing.T) {
@@ -14,7 +16,7 @@ func TestSortStableForEqualKeys(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	df, err := ScanCSV(p, ScanOptions{}).Sort("k", false).Collect()
+	df, err := g.ScanCSV(p, g.ScanOptions{}).Sort("k", false).Collect()
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}

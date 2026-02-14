@@ -1,10 +1,12 @@
-package grizzly
+package tests
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	g "grizzly"
 )
 
 func TestScanCSVInferenceNulls(t *testing.T) {
@@ -15,7 +17,7 @@ func TestScanCSVInferenceNulls(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	df, err := ScanCSV(p, ScanOptions{}).Collect()
+	df, err := g.ScanCSV(p, g.ScanOptions{}).Collect()
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -42,7 +44,7 @@ func TestScanCSVFilterPushdownEven(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	df, err := ScanCSV(p, ScanOptions{}).Filter(Col("id").Even()).Collect()
+	df, err := g.ScanCSV(p, g.ScanOptions{}).Filter(g.Col("id").Even()).Collect()
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -60,11 +62,43 @@ func TestScanCSVCollectContextCanceled(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := ScanCSV(p, ScanOptions{}).CollectContext(ctx)
+	_, err := g.ScanCSV(p, g.ScanOptions{}).CollectContext(ctx)
 	if err == nil {
 		t.Fatalf("expected cancellation error")
 	}
 	if err != context.Canceled {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestLazyGroupByAggCSV(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.csv")
+	data := "k,v\n1,10\n1,20\n2,1\n"
+	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	out, err := g.ScanCSV(p, g.ScanOptions{}).GroupBy("k").Agg(g.Count(), g.Sum("v").As("s")).Collect()
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if out.Height() != 2 {
+		t.Fatalf("expected 2 groups got %d", out.Height())
+	}
+	ks, _ := out.Column("k")
+	ki, ok := ks.Int64()
+	if !ok {
+		t.Fatalf("expected int64 key")
+	}
+	ss, _ := out.Column("s")
+	si, ok := ss.Int64()
+	if !ok {
+		t.Fatalf("expected int64 sum")
+	}
+	if ki.Value(0) != 1 || si.Value(0) != 30 {
+		t.Fatalf("unexpected group 0")
+	}
+	if ki.Value(1) != 2 || si.Value(1) != 1 {
+		t.Fatalf("unexpected group 1")
 	}
 }

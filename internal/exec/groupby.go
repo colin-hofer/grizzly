@@ -82,10 +82,6 @@ func (g *GroupBy) Agg(specs ...AggSpec) (*DataFrame, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown column %s", keyName)
 	}
-	ic, ok := keyCol.(*array.Int64Column)
-	if !ok {
-		return nil, fmt.Errorf("groupby: only int64 key supported")
-	}
 
 	resolved, err := resolveAggs(g.df, specs)
 	if err != nil {
@@ -93,49 +89,104 @@ func (g *GroupBy) Agg(specs ...AggSpec) (*DataFrame, error) {
 	}
 
 	// Preserve first-seen group order.
-	idx := make(map[int64]int, 256)
-	keys := make([]int64, 0, 256)
-	keyValid := make([]bool, 0, 256)
-	nullIdx := -1
+	switch kc := keyCol.(type) {
+	case *array.Int64Column:
+		idx := make(map[int64]int, 256)
+		keys := make([]int64, 0, 256)
+		keyValid := make([]bool, 0, 256)
+		nullIdx := -1
 
-	newGroup := func(key int64, valid bool) int {
-		gi := len(keys)
-		keys = append(keys, key)
-		keyValid = append(keyValid, valid)
-		for i := range resolved {
-			resolved[i].newGroup()
-		}
-		return gi
-	}
-
-	for row := 0; row < g.df.nrows; row++ {
-		var gi int
-		if ic.IsNull(row) {
-			if nullIdx < 0 {
-				nullIdx = newGroup(0, false)
+		newGroup := func(key int64, valid bool) int {
+			gi := len(keys)
+			keys = append(keys, key)
+			keyValid = append(keyValid, valid)
+			for i := range resolved {
+				resolved[i].newGroup()
 			}
-			gi = nullIdx
-		} else {
-			k := ic.Value(row)
-			var ok bool
-			gi, ok = idx[k]
-			if !ok {
-				gi = newGroup(k, true)
-				idx[k] = gi
+			return gi
+		}
+
+		for row := 0; row < g.df.nrows; row++ {
+			var gi int
+			if kc.IsNull(row) {
+				if nullIdx < 0 {
+					nullIdx = newGroup(0, false)
+				}
+				gi = nullIdx
+			} else {
+				k := kc.Value(row)
+				var ok bool
+				gi, ok = idx[k]
+				if !ok {
+					gi = newGroup(k, true)
+					idx[k] = gi
+				}
+			}
+			for i := range resolved {
+				resolved[i].observe(gi, row)
 			}
 		}
-		for i := range resolved {
-			resolved[i].observe(gi, row)
-		}
-	}
 
-	keyOut := array.NewInt64ColumnOwned(keyName, keys, array.NewBitmapFromBools(keyValid))
-	outCols := make([]array.Column, 0, 1+len(resolved))
-	outCols = append(outCols, keyOut)
-	for i := range resolved {
-		outCols = append(outCols, resolved[i].build())
+		keyOut := array.NewInt64ColumnOwned(keyName, keys, array.NewBitmapFromBools(keyValid))
+		outCols := make([]array.Column, 0, 1+len(resolved))
+		outCols = append(outCols, keyOut)
+		for i := range resolved {
+			outCols = append(outCols, resolved[i].build())
+		}
+		return NewDataFrame(outCols...)
+
+	case *array.Utf8Column:
+		idx := make(map[string]int, 256)
+		offsets := make([]int32, 1, 257)
+		bytesOut := make([]byte, 0, 2048)
+		keyValid := make([]bool, 0, 256)
+		nullIdx := -1
+
+		newGroup := func(key string, valid bool) int {
+			gi := len(keyValid)
+			keyValid = append(keyValid, valid)
+			if valid {
+				bytesOut = append(bytesOut, key...)
+			}
+			offsets = append(offsets, int32(len(bytesOut)))
+			for i := range resolved {
+				resolved[i].newGroup()
+			}
+			return gi
+		}
+
+		for row := 0; row < g.df.nrows; row++ {
+			var gi int
+			if kc.IsNull(row) {
+				if nullIdx < 0 {
+					nullIdx = newGroup("", false)
+				}
+				gi = nullIdx
+			} else {
+				k := kc.Value(row)
+				var ok bool
+				gi, ok = idx[k]
+				if !ok {
+					gi = newGroup(k, true)
+					idx[k] = gi
+				}
+			}
+			for i := range resolved {
+				resolved[i].observe(gi, row)
+			}
+		}
+
+		keyOut := array.NewUtf8ColumnOwned(keyName, offsets, bytesOut, array.NewBitmapFromBools(keyValid))
+		outCols := make([]array.Column, 0, 1+len(resolved))
+		outCols = append(outCols, keyOut)
+		for i := range resolved {
+			outCols = append(outCols, resolved[i].build())
+		}
+		return NewDataFrame(outCols...)
+
+	default:
+		return nil, fmt.Errorf("groupby: only int64/utf8 keys supported")
 	}
-	return NewDataFrame(outCols...)
 }
 
 type aggResolved interface {

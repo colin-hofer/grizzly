@@ -1,14 +1,16 @@
-package grizzly
+package tests
 
 import (
 	"strings"
 	"testing"
+
+	g "grizzly"
 )
 
 func TestDataFrameConvenienceOps(t *testing.T) {
-	a := MustNewInt64Column("a", []int64{1, 2, 3}, nil)
-	b := MustNewUtf8Column("b", []string{"x", "y", "z"}, nil)
-	df, err := NewDataFrame(a, b)
+	a := g.MustNewInt64Column("a", []int64{1, 2, 3}, nil)
+	b := g.MustNewUtf8Column("b", []string{"x", "y", "z"}, nil)
+	df, err := g.NewDataFrame(a, b)
 	if err != nil {
 		t.Fatalf("new dataframe: %v", err)
 	}
@@ -78,7 +80,7 @@ func TestDataFrameConvenienceOps(t *testing.T) {
 		t.Fatalf("expected renamed column x")
 	}
 
-	replaced, err := df.WithColumns(MustNewInt64Column("a", []int64{9, 9, 9}, nil))
+	replaced, err := df.WithColumns(g.MustNewInt64Column("a", []int64{9, 9, 9}, nil))
 	if err != nil {
 		t.Fatalf("with columns replace: %v", err)
 	}
@@ -87,7 +89,7 @@ func TestDataFrameConvenienceOps(t *testing.T) {
 		t.Fatalf("expected replaced a=9")
 	}
 
-	appended, err := df.WithColumns(MustNewBoolColumn("c", []bool{true, false, true}, nil))
+	appended, err := df.WithColumns(g.MustNewBoolColumn("c", []bool{true, false, true}, nil))
 	if err != nil {
 		t.Fatalf("with columns append: %v", err)
 	}
@@ -97,12 +99,12 @@ func TestDataFrameConvenienceOps(t *testing.T) {
 }
 
 func TestGroupByCountInt64Key(t *testing.T) {
-	k, err := NewInt64Column("k", []int64{1, 1, 2, 0}, []bool{true, true, true, false})
+	k, err := g.NewInt64Column("k", []int64{1, 1, 2, 0}, []bool{true, true, true, false})
 	if err != nil {
 		t.Fatalf("new column: %v", err)
 	}
-	v := MustNewUtf8Column("v", []string{"a", "b", "c", "d"}, nil)
-	df, err := NewDataFrame(k, v)
+	v := g.MustNewUtf8Column("v", []string{"a", "b", "c", "d"}, nil)
+	df, err := g.NewDataFrame(k, v)
 	if err != nil {
 		t.Fatalf("new dataframe: %v", err)
 	}
@@ -148,12 +150,12 @@ func TestGroupByCountInt64Key(t *testing.T) {
 }
 
 func TestGroupByAggsInt64(t *testing.T) {
-	k := MustNewInt64Column("k", []int64{1, 1, 2, 2, 2}, nil)
-	v, err := NewInt64Column("v", []int64{10, 0, 1, 0, 3}, []bool{true, false, true, false, true})
+	k := g.MustNewInt64Column("k", []int64{1, 1, 2, 2, 2}, nil)
+	v, err := g.NewInt64Column("v", []int64{10, 0, 1, 0, 3}, []bool{true, false, true, false, true})
 	if err != nil {
 		t.Fatalf("new v: %v", err)
 	}
-	df, err := NewDataFrame(k, v)
+	df, err := g.NewDataFrame(k, v)
 	if err != nil {
 		t.Fatalf("new dataframe: %v", err)
 	}
@@ -162,11 +164,11 @@ func TestGroupByAggsInt64(t *testing.T) {
 		t.Fatalf("groupby: %v", err)
 	}
 	out, err := gb.Agg(
-		Count(),
-		Sum("v").As("v_sum"),
-		Mean("v").As("v_mean"),
-		Min("v").As("v_min"),
-		Max("v").As("v_max"),
+		g.Count(),
+		g.Sum("v").As("v_sum"),
+		g.Mean("v").As("v_mean"),
+		g.Min("v").As("v_min"),
+		g.Max("v").As("v_max"),
 	)
 	if err != nil {
 		t.Fatalf("agg: %v", err)
@@ -215,13 +217,50 @@ func TestGroupByAggsInt64(t *testing.T) {
 	}
 }
 
-func TestExprIn(t *testing.T) {
-	a := MustNewInt64Column("a", []int64{1, 2, 3, 4}, nil)
-	df, err := NewDataFrame(a)
+func TestGroupByAggsUtf8Key(t *testing.T) {
+	k := g.MustNewUtf8Column("k", []string{"a", "a", "b", "b"}, nil)
+	v := g.MustNewFloat64Column("v", []float64{1.0, 2.0, 3.0, 0}, []bool{true, true, true, false})
+	df, err := g.NewDataFrame(k, v)
 	if err != nil {
 		t.Fatalf("new dataframe: %v", err)
 	}
-	out, err := df.Filter(Col("a").In(1, 3, 99))
+	gb, err := df.GroupBy("k")
+	if err != nil {
+		t.Fatalf("groupby: %v", err)
+	}
+	out, err := gb.Agg(g.Count(), g.Mean("v").As("m"), g.Min("v").As("mn"), g.Max("v").As("mx"))
+	if err != nil {
+		t.Fatalf("agg: %v", err)
+	}
+	if out.Height() != 2 {
+		t.Fatalf("expected 2 groups got %d", out.Height())
+	}
+	ks, _ := out.Column("k")
+	kc, ok := ks.Utf8()
+	if !ok {
+		t.Fatalf("expected utf8 key output")
+	}
+	if kc.Value(0) != "a" || kc.Value(1) != "b" {
+		t.Fatalf("unexpected key order")
+	}
+
+	ms, _ := out.Column("m")
+	mc, ok := ms.Float64()
+	if !ok {
+		t.Fatalf("expected float64 mean")
+	}
+	if mc.Value(0) != 1.5 || mc.Value(1) != 3 {
+		t.Fatalf("unexpected means")
+	}
+}
+
+func TestExprIn(t *testing.T) {
+	a := g.MustNewInt64Column("a", []int64{1, 2, 3, 4}, nil)
+	df, err := g.NewDataFrame(a)
+	if err != nil {
+		t.Fatalf("new dataframe: %v", err)
+	}
+	out, err := df.Filter(g.Col("a").In(1, 3, 99))
 	if err != nil {
 		t.Fatalf("filter: %v", err)
 	}
@@ -239,9 +278,9 @@ func TestExprIn(t *testing.T) {
 }
 
 func TestDataFrameStringPreview(t *testing.T) {
-	a := MustNewInt64Column("a", []int64{1, 2, 3, 4, 5, 6, 7}, nil)
-	b := MustNewUtf8Column("b", []string{"x", "", "z", "w", "u", "v", "t"}, nil)
-	df, err := NewDataFrame(a, b)
+	a := g.MustNewInt64Column("a", []int64{1, 2, 3, 4, 5, 6, 7}, nil)
+	b := g.MustNewUtf8Column("b", []string{"x", "", "z", "w", "u", "v", "t"}, nil)
+	df, err := g.NewDataFrame(a, b)
 	if err != nil {
 		t.Fatalf("new dataframe: %v", err)
 	}

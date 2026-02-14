@@ -1,13 +1,62 @@
-package grizzly
+package print
 
 import (
 	"fmt"
+	"grizzly/internal/array"
+	"grizzly/internal/exec"
 	"math"
+	"os"
 	"strconv"
 	"strings"
-
-	"grizzly/internal/array"
 )
+
+type tableCol struct {
+	name string
+	col  array.Column
+}
+
+func tableOverhead(idxWidth int, nDataCols int) int {
+	// The rendered table has:
+	// - 1 idx column + nDataCols columns
+	// - each cell adds 2 spaces and 1 separator => width+3
+	// - plus a leading separator char
+	// Total line width = 1 + 3*m + sum(widths) where m = 1 + nDataCols.
+	m := 1 + nDataCols
+	return 1 + 3*m + idxWidth
+}
+
+func tableLineWidth(widths []int) int {
+	sum := 0
+	for i := range widths {
+		sum += widths[i]
+	}
+	return 1 + 3*len(widths) + sum
+}
+
+func enforceTableWidth(widths []int, maxWidth int) {
+	if maxWidth <= 0 {
+		return
+	}
+	if len(widths) == 0 {
+		return
+	}
+	minCell := 4
+	// Keep shrinking the widest non-index column until we fit.
+	for tableLineWidth(widths) > maxWidth {
+		best := -1
+		bestW := 0
+		for i := 1; i < len(widths); i++ {
+			if widths[i] > bestW && widths[i] > minCell {
+				best = i
+				bestW = widths[i]
+			}
+		}
+		if best < 0 {
+			return
+		}
+		widths[best]--
+	}
+}
 
 type TableOptions struct {
 	Head int
@@ -28,33 +77,20 @@ func DefaultTableOptions() TableOptions {
 		Tail:          5,
 		MaxCols:       12,
 		MaxColWidth:   20,
-		MaxTableWidth: 120,
+		MaxTableWidth: 0, // auto
 		StatsRows:     10_000,
 	}
 }
 
-// String formats the DataFrame as a readable ASCII table.
-// It intentionally prints only a preview (head/tail) for large dataframes.
-func (df *DataFrame) String() string {
-	return df.Table(DefaultTableOptions())
-}
-
-func (df *DataFrame) Table(opts TableOptions) string {
-	if df == nil || df.df == nil {
+func Table(df *exec.DataFrame, opts TableOptions) string {
+	if df == nil {
 		return "<nil dataframe>"
 	}
 
 	nrows := df.Height()
 	ncols := df.Width()
 
-	cols := df.df.Columns()
-	if opts.MaxCols <= 0 {
-		opts.MaxCols = len(cols)
-	}
-	showCols := cols
-	if len(showCols) > opts.MaxCols {
-		showCols = showCols[:opts.MaxCols]
-	}
+	cols := df.Columns()
 
 	if opts.Head < 0 {
 		opts.Head = 0
@@ -72,7 +108,7 @@ func (df *DataFrame) Table(opts TableOptions) string {
 	}
 	maxTableWidth := opts.MaxTableWidth
 	if maxTableWidth <= 0 {
-		maxTableWidth = 120
+		maxTableWidth = detectStdoutWidth(120)
 	}
 
 	idxWidth := 3
@@ -86,23 +122,24 @@ func (df *DataFrame) Table(opts TableOptions) string {
 		idxWidth = max(idxWidth, len(strconv.Itoa(maxIdx)))
 	}
 
-	// If the table would exceed the max width, reduce per-column width.
-	if len(showCols) > 0 {
-		sepCount := 1 + 1 + len(showCols) // left border + idx separator + col seps
-		fixed := sepCount + idxWidth
-		avail := maxTableWidth - fixed
+	show := selectTableCols(cols, maxTableWidth, idxWidth, maxColWidth, opts.MaxCols)
+
+	// Cap per-column width to fit the table budget.
+	if len(show) > 0 {
+		overhead := tableOverhead(idxWidth, len(show))
+		avail := maxTableWidth - overhead
 		if avail > 0 {
-			per := avail / len(showCols)
+			per := avail / len(show)
 			if per < maxColWidth {
-				maxColWidth = max(6, per)
+				maxColWidth = max(4, per)
 			}
 		}
 	}
 
-	widths := make([]int, 1+len(showCols))
+	widths := make([]int, 1+len(show))
 	widths[0] = idxWidth
-	for j := range showCols {
-		w := len(showCols[j].Name())
+	for j := range show {
+		w := len(show[j].name)
 		if w > maxColWidth {
 			w = maxColWidth
 		}
@@ -113,29 +150,134 @@ func (df *DataFrame) Table(opts TableOptions) string {
 	for _, r := range rowIdx {
 		if r < 0 {
 			widths[0] = max(widths[0], 3)
-			for j := range showCols {
+			for j := range show {
 				widths[1+j] = max(widths[1+j], 3)
 			}
 			continue
 		}
 		widths[0] = max(widths[0], len(strconv.Itoa(r)))
-		for j := range showCols {
-			cell := cellString(showCols[j], r)
+		for j := range show {
+			cell := cellString(show[j], r)
 			cell = truncate(cell, maxColWidth)
 			widths[1+j] = max(widths[1+j], len(cell))
 		}
 	}
 
+	// Final hard clamp: shrink columns until the table fits.
+	enforceTableWidth(widths, maxTableWidth)
+
 	var b strings.Builder
 	b.WriteString("DataFrame")
 	b.WriteString(fmt.Sprintf(" shape: (%d, %d)", nrows, ncols))
 	b.WriteByte('\n')
-	if len(showCols) != ncols {
-		b.WriteString(fmt.Sprintf("Preview columns: %d of %d\n", len(showCols), ncols))
+	if countRealCols(show) != ncols {
+		b.WriteString(fmt.Sprintf("Preview columns: %d of %d\n", countRealCols(show), ncols))
 	}
-	b.WriteString(renderStats(showCols, nrows, opts.StatsRows))
-	b.WriteString(renderTable(showCols, widths, rowIdx))
+	b.WriteString(renderStats(show, nrows, opts.StatsRows, maxTableWidth))
+	b.WriteString(renderTable(show, widths, rowIdx))
 	return b.String()
+}
+
+func detectStdoutWidth(fallback int) int {
+	if w, ok := stdoutTerminalWidth(); ok {
+		// Be conservative: many terminals will wrap if we hit exactly the limit.
+		if w >= 40 {
+			return w - 1
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("COLUMNS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 40 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func countRealCols(cols []tableCol) int {
+	n := 0
+	for i := range cols {
+		if cols[i].col != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func selectTableCols(cols []array.Column, maxTableWidth, idxWidth, maxColWidth, maxCols int) []tableCol {
+	if len(cols) == 0 {
+		return nil
+	}
+	if maxCols <= 0 || maxCols > len(cols) {
+		maxCols = len(cols)
+	}
+	minColWidth := 6
+	if maxColWidth < minColWidth {
+		minColWidth = maxColWidth
+	}
+	if minColWidth < 4 {
+		minColWidth = 4
+	}
+
+	// Best-effort: keep as many columns as can fit at min width.
+	// Total line width is: overhead + sum(widths of shown data cols).
+	fits := func(n int) bool {
+		if n <= 0 {
+			return true
+		}
+		overhead := tableOverhead(idxWidth, n)
+		need := overhead + n*minColWidth
+		return need <= maxTableWidth
+	}
+
+	// If we can't fit even one real column plus idx, force one.
+	if !fits(1) {
+		return []tableCol{{name: cols[0].Name(), col: cols[0]}}
+	}
+
+	// Start with maxCols, reduce until it fits.
+	n := maxCols
+	for n > 1 && !fits(n) {
+		n--
+	}
+	if n >= len(cols) {
+		out := make([]tableCol, len(cols))
+		for i := range cols {
+			out[i] = tableCol{name: cols[i].Name(), col: cols[i]}
+		}
+		return out
+	}
+
+	// If we truncated columns, attempt Polars-like elision: left ... right.
+	// Use one slot for "...".
+	if n <= 2 {
+		out := make([]tableCol, n)
+		for i := 0; i < n; i++ {
+			out[i] = tableCol{name: cols[i].Name(), col: cols[i]}
+		}
+		return out
+	}
+
+	left := (n - 1) / 2
+	right := n - 1 - left
+	if left < 1 {
+		left = 1
+	}
+	if right < 1 {
+		right = 1
+	}
+	if left+right+1 != n {
+		right = n - 1 - left
+	}
+
+	out := make([]tableCol, 0, n)
+	for i := 0; i < left; i++ {
+		out = append(out, tableCol{name: cols[i].Name(), col: cols[i]})
+	}
+	out = append(out, tableCol{name: "...", col: nil})
+	for i := len(cols) - right; i < len(cols); i++ {
+		out = append(out, tableCol{name: cols[i].Name(), col: cols[i]})
+	}
+	return out
 }
 
 func previewRowIndices(nrows, head, tail int) []int {
@@ -168,7 +310,7 @@ func previewRowIndices(nrows, head, tail int) []int {
 	return idx
 }
 
-func renderTable(cols []array.Column, widths []int, rowIdx []int) string {
+func renderTable(cols []tableCol, widths []int, rowIdx []int) string {
 	var b strings.Builder
 	if len(cols) == 0 {
 		b.WriteString("(no columns)\n")
@@ -194,7 +336,7 @@ func renderTable(cols []array.Column, widths []int, rowIdx []int) string {
 	b.WriteByte('|')
 	for j := range cols {
 		b.WriteByte(' ')
-		b.WriteString(pad(truncate(cols[j].Name(), widths[1+j]), widths[1+j]))
+		b.WriteString(pad(truncate(cols[j].name, widths[1+j]), widths[1+j]))
 		b.WriteByte(' ')
 		b.WriteByte('|')
 	}
@@ -229,20 +371,23 @@ func renderTable(cols []array.Column, widths []int, rowIdx []int) string {
 	return b.String()
 }
 
-func cellString(col array.Column, row int) string {
-	if col.IsNull(row) {
+func cellString(col tableCol, row int) string {
+	if col.col == nil {
+		return "..."
+	}
+	if col.col.IsNull(row) {
 		return "null"
 	}
-	s := col.ValueString(row)
+	s := col.col.ValueString(row)
 	if s == "" {
-		if _, ok := col.(*array.Utf8Column); ok {
+		if _, ok := col.col.(*array.Utf8Column); ok {
 			return "\"\""
 		}
 	}
 	return s
 }
 
-func renderStats(cols []array.Column, nrows int, statsRows int) string {
+func renderStats(cols []tableCol, nrows int, statsRows int, maxWidth int) string {
 	if statsRows <= 0 {
 		return ""
 	}
@@ -262,15 +407,17 @@ func renderStats(cols []array.Column, nrows int, statsRows int) string {
 	b.WriteString(":\n")
 
 	for i := range cols {
-		c := cols[i]
+		if cols[i].col == nil {
+			continue
+		}
+		c := cols[i].col
 		dt := c.DType().String()
 		st := statsForColumn(c, limit)
-		b.WriteString("- ")
-		b.WriteString(c.Name())
-		b.WriteString(": ")
-		b.WriteString(dt)
-		b.WriteString("  ")
-		b.WriteString(st)
+		line := "- " + c.Name() + ": " + dt + "  " + st
+		if maxWidth > 0 {
+			line = truncate(line, maxWidth)
+		}
+		b.WriteString(line)
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
