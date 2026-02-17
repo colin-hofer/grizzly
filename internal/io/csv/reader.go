@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 
 	"os"
@@ -27,12 +26,31 @@ type ReadPlan struct {
 
 type NullMatcher struct {
 	single string
+	small  []string
 	set    map[string]struct{}
 }
 
 func NewNullMatcher(values []string) NullMatcher {
+	if len(values) == 0 {
+		return NullMatcher{single: ""}
+	}
 	if len(values) == 1 {
 		return NullMatcher{single: values[0]}
+	}
+	if len(values) <= 4 {
+		uniq := make([]string, 0, len(values))
+		seen := make(map[string]struct{}, len(values))
+		for i := range values {
+			if _, ok := seen[values[i]]; ok {
+				continue
+			}
+			seen[values[i]] = struct{}{}
+			uniq = append(uniq, values[i])
+		}
+		if len(uniq) == 1 {
+			return NullMatcher{single: uniq[0]}
+		}
+		return NullMatcher{small: uniq}
 	}
 	set := make(map[string]struct{}, len(values))
 	for i := range values {
@@ -47,8 +65,16 @@ func NewNullMatcher(values []string) NullMatcher {
 }
 
 func (m NullMatcher) IsNull(raw string) bool {
-	if m.set == nil {
+	if m.set == nil && len(m.small) == 0 {
 		return raw == m.single
+	}
+	if len(m.small) > 0 {
+		for i := range m.small {
+			if raw == m.small[i] {
+				return true
+			}
+		}
+		return false
 	}
 	_, ok := m.set[raw]
 	return ok
@@ -307,7 +333,8 @@ func Read(ctx context.Context, path string, delimiter rune, nullValues []string,
 
 type parseJob struct {
 	index int
-	rows  [][]string
+	rows  []string
+	nrows int
 }
 
 func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string, included []int, filterIdx int, nulls NullMatcher, dtypes []array.DataType, builders []typedBuilder, startRow int) error {
@@ -318,9 +345,14 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 		return parseRemainingSequential(ctx, r, header, included, filterIdx, nulls, builders, startRow)
 	}
 
-	chunk := make([][]string, 0, chunkRows)
+	chunkValues := make([]string, 0, chunkRows*len(included))
+	chunkNRows := 0
 	chunkIndex := 0
-	batch := make([]parseJob, 0, workers*2)
+	maxBatchJobs := workers * 8
+	if maxBatchJobs < 8 {
+		maxBatchJobs = 8
+	}
+	batch := make([]parseJob, 0, maxBatchJobs)
 
 	flushBatch := func() error {
 		if len(batch) == 0 {
@@ -348,14 +380,13 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 	}
 
 	flushChunk := func() {
-		if len(chunk) == 0 {
+		if chunkNRows == 0 {
 			return
 		}
-		cp := make([][]string, len(chunk))
-		copy(cp, chunk)
-		batch = append(batch, parseJob{index: chunkIndex, rows: cp})
+		batch = append(batch, parseJob{index: chunkIndex, rows: chunkValues, nrows: chunkNRows})
 		chunkIndex++
-		chunk = make([][]string, 0, chunkRows)
+		chunkValues = make([]string, 0, chunkRows*len(included))
+		chunkNRows = 0
 	}
 	iter := 0
 	for {
@@ -378,14 +409,13 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
 			continue
 		}
-		projected := make([]string, len(included))
-		for i, src := range included {
-			projected[i] = rec[src]
+		for _, src := range included {
+			chunkValues = append(chunkValues, rec[src])
 		}
-		chunk = append(chunk, projected)
-		if len(chunk) >= chunkRows {
+		chunkNRows++
+		if chunkNRows >= chunkRows {
 			flushChunk()
-			if len(batch) >= workers*2 {
+			if len(batch) >= maxBatchJobs {
 				if err := flushBatch(); err != nil {
 					return err
 				}
@@ -416,20 +446,22 @@ func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, 
 			const ctxCheckMask = 1024 - 1
 			job := batch[i]
 			local := make([]typedBuilder, len(dtypes))
-			rowsCap := len(job.rows)
+			rowsCap := job.nrows
 			for j := range dtypes {
 				local[j] = newBuilder(dtypes[j], nulls, rowsCap)
 			}
 			row := startRow + job.index*chunkRows
-			for r := range job.rows {
+			ncols := len(dtypes)
+			for r := 0; r < job.nrows; r++ {
 				if cancellable && (r&ctxCheckMask) == 0 {
 					if err := ctx.Err(); err != nil {
 						errCh <- err
 						return
 					}
 				}
-				for c := range job.rows[r] {
-					if err := local[c].Append(job.rows[r][c], row+r); err != nil {
+				base := r * ncols
+				for c := 0; c < ncols; c++ {
+					if err := local[c].Append(job.rows[base+c], row+r); err != nil {
 						errCh <- err
 						return
 					}
@@ -536,7 +568,7 @@ func newBuilder(dtype array.DataType, nulls NullMatcher, rowsCap int) typedBuild
 		return &genericBuilder[bool]{
 			data:  make([]bool, 0, rowsCap),
 			nulls: nulls,
-			parse: func(raw string) (bool, error) { return strconv.ParseBool(strings.ToLower(raw)) },
+			parse: parseBoolASCII,
 			construct: func(name string, data []bool, valid array.Bitmap) array.Column {
 				return array.NewBoolColumnOwned(name, data, valid)
 			},
@@ -564,7 +596,7 @@ func inferType(values []string, nulls NullMatcher) array.DataType {
 		if _, err := strconv.ParseFloat(values[i], 64); err != nil {
 			allFloat = false
 		}
-		if _, err := strconv.ParseBool(strings.ToLower(values[i])); err != nil {
+		if _, err := parseBoolASCII(values[i]); err != nil {
 			allBool = false
 		}
 		if !allInt && !allFloat && !allBool {
@@ -611,4 +643,25 @@ func fastIntEven(raw string) (bool, bool) {
 	}
 	last := raw[len(raw)-1]
 	return (last-'0')%2 == 0, true
+}
+
+func parseBoolASCII(raw string) (bool, error) {
+	if len(raw) == 4 {
+		if (raw[0] == 't' || raw[0] == 'T') &&
+			(raw[1] == 'r' || raw[1] == 'R') &&
+			(raw[2] == 'u' || raw[2] == 'U') &&
+			(raw[3] == 'e' || raw[3] == 'E') {
+			return true, nil
+		}
+	}
+	if len(raw) == 5 {
+		if (raw[0] == 'f' || raw[0] == 'F') &&
+			(raw[1] == 'a' || raw[1] == 'A') &&
+			(raw[2] == 'l' || raw[2] == 'L') &&
+			(raw[3] == 's' || raw[3] == 'S') &&
+			(raw[4] == 'e' || raw[4] == 'E') {
+			return false, nil
+		}
+	}
+	return strconv.ParseBool(raw)
 }
