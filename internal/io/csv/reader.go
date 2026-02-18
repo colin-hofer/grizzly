@@ -337,6 +337,119 @@ type parseJob struct {
 	nrows int
 }
 
+type builderPools struct {
+	intPool   sync.Pool
+	floatPool sync.Pool
+	boolPool  sync.Pool
+	utf8Pool  sync.Pool
+}
+
+func newBuilderPools() *builderPools {
+	p := &builderPools{}
+	p.intPool.New = func() any {
+		return &genericBuilder[int64]{
+			parse: func(raw string) (int64, error) { return strconv.ParseInt(raw, 10, 64) },
+			construct: func(name string, data []int64, valid array.Bitmap) array.Column {
+				return array.NewInt64ColumnOwned(name, data, valid)
+			},
+		}
+	}
+	p.floatPool.New = func() any {
+		return &genericBuilder[float64]{
+			parse: func(raw string) (float64, error) { return strconv.ParseFloat(raw, 64) },
+			construct: func(name string, data []float64, valid array.Bitmap) array.Column {
+				return array.NewFloat64ColumnOwned(name, data, valid)
+			},
+		}
+	}
+	p.boolPool.New = func() any {
+		return &genericBuilder[bool]{
+			parse: parseBoolASCII,
+			construct: func(name string, data []bool, valid array.Bitmap) array.Column {
+				return array.NewBoolColumnOwned(name, data, valid)
+			},
+		}
+	}
+	p.utf8Pool.New = func() any {
+		return &utf8Builder{}
+	}
+	return p
+}
+
+func (p *builderPools) acquire(dtype array.DataType, nulls NullMatcher, rowsCap int, bytesCap int) typedBuilder {
+	if rowsCap < 16 {
+		rowsCap = 16
+	}
+	switch dtype.Kind {
+	case array.KindInt:
+		b := p.intPool.Get().(*genericBuilder[int64])
+		resetGenericBuilder(b, nulls, rowsCap)
+		return b
+	case array.KindFloat:
+		b := p.floatPool.Get().(*genericBuilder[float64])
+		resetGenericBuilder(b, nulls, rowsCap)
+		return b
+	case array.KindBool:
+		b := p.boolPool.Get().(*genericBuilder[bool])
+		resetGenericBuilder(b, nulls, rowsCap)
+		return b
+	default:
+		b := p.utf8Pool.Get().(*utf8Builder)
+		resetUTF8Builder(b, nulls, rowsCap, bytesCap)
+		return b
+	}
+}
+
+func (p *builderPools) release(dtype array.DataType, b typedBuilder) {
+	switch dtype.Kind {
+	case array.KindInt:
+		if gb, ok := b.(*genericBuilder[int64]); ok {
+			p.intPool.Put(gb)
+		}
+	case array.KindFloat:
+		if gb, ok := b.(*genericBuilder[float64]); ok {
+			p.floatPool.Put(gb)
+		}
+	case array.KindBool:
+		if gb, ok := b.(*genericBuilder[bool]); ok {
+			p.boolPool.Put(gb)
+		}
+	default:
+		if ub, ok := b.(*utf8Builder); ok {
+			p.utf8Pool.Put(ub)
+		}
+	}
+}
+
+func resetGenericBuilder[T any](b *genericBuilder[T], nulls NullMatcher, rowsCap int) {
+	b.nulls = nulls
+	if cap(b.data) < rowsCap {
+		b.data = make([]T, 0, rowsCap)
+	} else {
+		b.data = b.data[:0]
+	}
+	b.valid = array.BitmapBuilder{}
+}
+
+func resetUTF8Builder(b *utf8Builder, nulls NullMatcher, rowsCap int, bytesCap int) {
+	b.nulls = nulls
+	b.valid = array.BitmapBuilder{}
+	if cap(b.offsets) < rowsCap+1 {
+		b.offsets = make([]int32, 1, rowsCap+1)
+	} else {
+		b.offsets = b.offsets[:1]
+		b.offsets[0] = 0
+	}
+	if bytesCap < 256 {
+		bytesCap = 256
+	}
+	if cap(b.bytes) < bytesCap {
+		b.bytes = make([]byte, 0, bytesCap)
+	} else {
+		b.bytes = b.bytes[:0]
+	}
+}
+
 func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string, included []int, filterIdx int, nulls NullMatcher, dtypes []array.DataType, builders []typedBuilder, startRow int) error {
 	cancellable := ctx != nil && ctx.Done() != nil
 	const ctxCheckMask = 1024 - 1
@@ -353,6 +466,11 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 		maxBatchJobs = 8
 	}
 	batch := make([]parseJob, 0, maxBatchJobs)
+	bpools := newBuilderPools()
+	ncols := len(included)
+	chunkPool := sync.Pool{New: func() any {
+		return make([]string, 0, chunkRows*ncols)
+	}}
 
 	flushBatch := func() error {
 		if len(batch) == 0 {
@@ -363,7 +481,7 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 				return err
 			}
 		}
-		results, err := parseBatch(ctx, batch, dtypes, nulls, startRow)
+		results, err := parseBatch(ctx, batch, dtypes, nulls, startRow, bpools)
 		if err != nil {
 			return err
 		}
@@ -373,7 +491,14 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 				if err := builders[j].AppendBuilder(res[j]); err != nil {
 					return err
 				}
+				bpools.release(dtypes[j], res[j])
 			}
+		}
+		for i := range batch {
+			if cap(batch[i].rows) > chunkRows*ncols*4 {
+				continue
+			}
+			chunkPool.Put(batch[i].rows[:0])
 		}
 		batch = batch[:0]
 		return nil
@@ -385,7 +510,8 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 		}
 		batch = append(batch, parseJob{index: chunkIndex, rows: chunkValues, nrows: chunkNRows})
 		chunkIndex++
-		chunkValues = make([]string, 0, chunkRows*len(included))
+		chunkValues = chunkPool.Get().([]string)
+		chunkValues = chunkValues[:0]
 		chunkNRows = 0
 	}
 	iter := 0
@@ -429,7 +555,7 @@ func parseRemainingParallel(ctx context.Context, r *csv.Reader, header []string,
 	return nil
 }
 
-func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, nulls NullMatcher, startRow int) ([][]typedBuilder, error) {
+func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, nulls NullMatcher, startRow int, bpools *builderPools) ([][]typedBuilder, error) {
 	cancellable := ctx != nil && ctx.Done() != nil
 	if cancellable {
 		if err := ctx.Err(); err != nil {
@@ -437,6 +563,12 @@ func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, 
 		}
 	}
 	results := make([][]typedBuilder, len(batch))
+	utf8Cols := make([]int, 0, len(dtypes))
+	for i := range dtypes {
+		if dtypes[i].Kind == array.KindUtf8 {
+			utf8Cols = append(utf8Cols, i)
+		}
+	}
 	errCh := make(chan error, len(batch))
 	var wg sync.WaitGroup
 	for i := range batch {
@@ -447,8 +579,22 @@ func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, 
 			job := batch[i]
 			local := make([]typedBuilder, len(dtypes))
 			rowsCap := job.nrows
+			utf8Bytes := make([]int, len(dtypes))
+			if len(utf8Cols) > 0 {
+				ncols := len(dtypes)
+				for r := 0; r < job.nrows; r++ {
+					base := r * ncols
+					for _, c := range utf8Cols {
+						raw := job.rows[base+c]
+						if nulls.IsNull(raw) {
+							continue
+						}
+						utf8Bytes[c] += len(raw)
+					}
+				}
+			}
 			for j := range dtypes {
-				local[j] = newBuilder(dtypes[j], nulls, rowsCap)
+				local[j] = bpools.acquire(dtypes[j], nulls, rowsCap, utf8Bytes[j])
 			}
 			row := startRow + job.index*chunkRows
 			ncols := len(dtypes)
