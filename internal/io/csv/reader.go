@@ -25,9 +25,10 @@ type ReadPlan struct {
 }
 
 type NullMatcher struct {
-	single string
-	small  []string
-	set    map[string]struct{}
+	single     string
+	smallVals  [4]string
+	smallCount uint8
+	set        map[string]struct{}
 }
 
 func NewNullMatcher(values []string) NullMatcher {
@@ -50,7 +51,11 @@ func NewNullMatcher(values []string) NullMatcher {
 		if len(uniq) == 1 {
 			return NullMatcher{single: uniq[0]}
 		}
-		return NullMatcher{small: uniq}
+		m := NullMatcher{smallCount: uint8(len(uniq))}
+		for i := range uniq {
+			m.smallVals[i] = uniq[i]
+		}
+		return m
 	}
 	set := make(map[string]struct{}, len(values))
 	for i := range values {
@@ -65,19 +70,22 @@ func NewNullMatcher(values []string) NullMatcher {
 }
 
 func (m NullMatcher) IsNull(raw string) bool {
-	if m.set == nil && len(m.small) == 0 {
+	if m.set != nil {
+		_, ok := m.set[raw]
+		return ok
+	}
+	switch m.smallCount {
+	case 0:
 		return raw == m.single
+	case 1:
+		return raw == m.smallVals[0]
+	case 2:
+		return raw == m.smallVals[0] || raw == m.smallVals[1]
+	case 3:
+		return raw == m.smallVals[0] || raw == m.smallVals[1] || raw == m.smallVals[2]
+	default:
+		return raw == m.smallVals[0] || raw == m.smallVals[1] || raw == m.smallVals[2] || raw == m.smallVals[3]
 	}
-	if len(m.small) > 0 {
-		for i := range m.small {
-			if raw == m.small[i] {
-				return true
-			}
-		}
-		return false
-	}
-	_, ok := m.set[raw]
-	return ok
 }
 
 type typedBuilder interface {
@@ -263,10 +271,11 @@ func Read(ctx context.Context, path string, delimiter rune, nullValues []string,
 	for i := range samples {
 		samples[i] = make([]string, 0, typeSampleRows)
 	}
-	records := make([][]string, 0, typeSampleRows)
+	seedValues := make([]string, 0, typeSampleRows*len(included))
+	seedRows := 0
 	const ctxCheckMask = 1024 - 1
 	iter := 0
-	for len(records) < typeSampleRows {
+	for seedRows < typeSampleRows {
 		iter++
 		if cancellable && (iter&ctxCheckMask) == 0 {
 			if err := ctx.Err(); err != nil {
@@ -286,12 +295,12 @@ func Read(ctx context.Context, path string, delimiter rune, nullValues []string,
 		if filterIdx >= 0 && !rawEven(rec[filterIdx], nulls) {
 			continue
 		}
-		projected := make([]string, len(included))
 		for i, src := range included {
-			projected[i] = rec[src]
-			samples[i] = append(samples[i], rec[src])
+			raw := rec[src]
+			samples[i] = append(samples[i], raw)
+			seedValues = append(seedValues, raw)
 		}
-		records = append(records, projected)
+		seedRows++
 	}
 
 	dtypes := make([]array.DataType, len(included))
@@ -299,21 +308,23 @@ func Read(ctx context.Context, path string, delimiter rune, nullValues []string,
 		dtypes[i] = inferType(samples[i], nulls)
 	}
 
-	seedRows := len(records) + chunkRows
+	reserveRows := seedRows + chunkRows
 	builders := make([]typedBuilder, len(included))
 	for i := range included {
-		builders[i] = newBuilder(dtypes[i], nulls, seedRows)
+		builders[i] = newBuilder(dtypes[i], nulls, reserveRows)
 	}
 
 	row := 1
-	for i := range records {
+	ncols := len(included)
+	for i := 0; i < seedRows; i++ {
 		if cancellable && (i&ctxCheckMask) == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		for j := range records[i] {
-			if err := builders[j].Append(records[i][j], row); err != nil {
+		base := i * ncols
+		for j := 0; j < ncols; j++ {
+			if err := builders[j].Append(seedValues[base+j], row); err != nil {
 				return nil, err
 			}
 		}
@@ -585,11 +596,7 @@ func parseBatch(ctx context.Context, batch []parseJob, dtypes []array.DataType, 
 				for r := 0; r < job.nrows; r++ {
 					base := r * ncols
 					for _, c := range utf8Cols {
-						raw := job.rows[base+c]
-						if nulls.IsNull(raw) {
-							continue
-						}
-						utf8Bytes[c] += len(raw)
+						utf8Bytes[c] += len(job.rows[base+c])
 					}
 				}
 			}

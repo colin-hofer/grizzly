@@ -250,31 +250,51 @@ func (df *DataFrame) SortBy(column string, desc bool) (*DataFrame, error) {
 	switch col := c.(type) {
 	case *array.Int64Column:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareInt64(col.Value(a), col.Value(b), desc))
+			aNull := col.IsNull(a)
+			bNull := col.IsNull(b)
+			if aNull || bNull {
+				return compareNullOnly(aNull, bNull)
+			}
+			return compareInt64(col.Value(a), col.Value(b), desc)
 		}
 	case *array.Float64Column:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareFloat64(col.Value(a), col.Value(b), desc))
+			aNull := col.IsNull(a)
+			bNull := col.IsNull(b)
+			if aNull || bNull {
+				return compareNullOnly(aNull, bNull)
+			}
+			return compareFloat64(col.Value(a), col.Value(b), desc)
 		}
 	case *array.BoolColumn:
 		cmp = func(a, b int) int {
-			return compareNullAware(col.IsNull(a), col.IsNull(b), compareBool(col.Value(a), col.Value(b), desc))
+			aNull := col.IsNull(a)
+			bNull := col.IsNull(b)
+			if aNull || bNull {
+				return compareNullOnly(aNull, bNull)
+			}
+			return compareBool(col.Value(a), col.Value(b), desc)
 		}
 	case *array.Utf8Column:
 		cmp = func(a, b int) int {
+			aNull := col.IsNull(a)
+			bNull := col.IsNull(b)
+			if aNull || bNull {
+				return compareNullOnly(aNull, bNull)
+			}
 			ord := col.CompareRows(a, b)
 			if desc {
 				ord = -ord
 			}
-			return compareNullAware(col.IsNull(a), col.IsNull(b), ord)
+			return ord
 		}
 	default:
 		return nil, fmt.Errorf("unsupported sort dtype %s", c.DType())
 	}
 	if df.nrows >= parallelSortThreshold && runtime.GOMAXPROCS(0) > 1 {
-		parallelStableSort(order, cmp)
+		parallelSort(order, cmp)
 	} else {
-		sort.SliceStable(order, func(i, j int) bool {
+		sort.Slice(order, func(i, j int) bool {
 			o := cmp(order[i], order[j])
 			if o == 0 {
 				return order[i] < order[j]
@@ -396,12 +416,6 @@ const (
 	colKindUtf8
 )
 
-type utf8View interface {
-	ByteRange(i int) (int, int)
-	Bytes() []byte
-	IsNull(i int) bool
-}
-
 type columnView struct {
 	kind columnKind
 	i64  *array.Int64Column
@@ -470,15 +484,19 @@ func writeJSONStringEscapedBytes(buf *bytes.Buffer, b []byte) {
 	buf.WriteByte('"')
 }
 
-func compareNullAware(aNull, bNull bool, ord int) int {
-	if aNull && bNull {
+func compareNullOnly(aNull, bNull bool) int {
+	if aNull == bNull {
 		return 0
 	}
 	if aNull {
 		return 1
 	}
-	if bNull {
-		return -1
+	return -1
+}
+
+func compareNullAware(aNull, bNull bool, ord int) int {
+	if aNull || bNull {
+		return compareNullOnly(aNull, bNull)
 	}
 	return ord
 }
@@ -566,10 +584,10 @@ func (h *mergeHeap) Pop() any {
 	return v
 }
 
-func parallelStableSort(order []int, cmp func(a, b int) int) {
+func parallelSort(order []int, cmp func(a, b int) int) {
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 || len(order) < workers*4096 {
-		sort.SliceStable(order, func(i, j int) bool {
+		sort.Slice(order, func(i, j int) bool {
 			o := cmp(order[i], order[j])
 			if o == 0 {
 				return order[i] < order[j]
@@ -593,7 +611,7 @@ func parallelStableSort(order []int, cmp func(a, b int) int) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			sort.SliceStable(runs[idx].data, func(a, b int) bool {
+			sort.Slice(runs[idx].data, func(a, b int) bool {
 				x := runs[idx].data[a]
 				y := runs[idx].data[b]
 				o := cmp(x, y)

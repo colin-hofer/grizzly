@@ -5,15 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 
 	"grizzly/internal/array"
 	"grizzly/internal/exec"
-	csvio "grizzly/internal/io/csv"
 )
+
+const fastPathMaxBytes = 64 << 20
 
 func Read(ctx context.Context, path string) (*exec.DataFrame, error) {
 	if ctx == nil {
@@ -26,6 +27,16 @@ func Read(ctx context.Context, path string) (*exec.DataFrame, error) {
 			return nil, err
 		}
 	}
+	if !cancellable {
+		rows, usedFastPath, err := readAllRowsFast(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if usedFastPath {
+			return recordsToFrame(ctx, rows)
+		}
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -85,6 +96,29 @@ func Read(ctx context.Context, path string) (*exec.DataFrame, error) {
 		return nil, err
 	}
 	return recordsToFrame(ctx, rows)
+}
+
+func readAllRowsFast(ctx context.Context, path string) ([]map[string]any, bool, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if fi.Size() > fastPathMaxBytes {
+		return nil, false, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	var payload any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, true, err
+	}
+	rows, err := normalizeJSONRows(ctx, payload)
+	if err != nil {
+		return nil, true, err
+	}
+	return rows, true, nil
 }
 
 func peekFirstNonSpaceByte(br *bufio.Reader) (byte, error) {
@@ -168,146 +202,153 @@ func recordsToFrame(ctx context.Context, rows []map[string]any) (*exec.DataFrame
 	}
 	sort.Strings(keys)
 	cols := make([]array.Column, 0, len(keys))
-	nulls := csvio.NewNullMatcher([]string{""})
 	for _, key := range keys {
 		if cancellable {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		raw := make([]string, 0, len(rows))
-		for i := range rows {
-			v, ok := rows[i][key]
-			if !ok || v == nil {
-				raw = append(raw, "")
-				continue
-			}
-			raw = append(raw, fmt.Sprint(v))
+		dtype := inferType(rows, key)
+		col, err := buildColumn(ctx, key, dtype, rows)
+		if err != nil {
+			return nil, err
 		}
-		dtype := inferType(raw, nulls)
-		b := newBuilder(dtype, nulls, len(raw))
-		for i := range raw {
+		cols = append(cols, col)
+	}
+	return exec.NewDataFrame(cols...)
+}
+
+func buildColumn(ctx context.Context, name string, dtype array.DataType, rows []map[string]any) (array.Column, error) {
+	cancellable := ctx != nil && ctx.Done() != nil
+	const ctxCheckMask = 1024 - 1
+	switch dtype.Kind {
+	case array.KindInt:
+		data := make([]int64, len(rows))
+		valid := array.BitmapBuilder{}
+		for i := range rows {
 			if cancellable && (i&ctxCheckMask) == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
 			}
-			if err := b.Append(raw[i], i+1); err != nil {
-				return nil, err
+			v, ok := rows[i][name]
+			if !ok || v == nil || isNullString(v) {
+				valid.Append(false)
+				continue
 			}
+			n, ok := toInt64(v)
+			if !ok {
+				return nil, fmt.Errorf("row %d parse value: cannot parse int64", i+1)
+			}
+			data[i] = n
+			valid.Append(true)
 		}
-		cols = append(cols, b.Build(key))
-	}
-	return exec.NewDataFrame(cols...)
-}
-
-// minimal builder logic for JSON read path (shares NullMatcher with CSV IO).
-type typedBuilder interface {
-	Append(raw string, row int) error
-	Build(name string) array.Column
-}
-
-type genericBuilder[T any] struct {
-	data      []T
-	valid     array.BitmapBuilder
-	nulls     csvio.NullMatcher
-	parse     func(string) (T, error)
-	construct func(name string, data []T, valid array.Bitmap) array.Column
-}
-
-func (b *genericBuilder[T]) Append(raw string, row int) error {
-	var zero T
-	b.data = append(b.data, zero)
-	if b.nulls.IsNull(raw) {
-		b.valid.Append(false)
-		return nil
-	}
-	v, err := b.parse(raw)
-	if err != nil {
-		return fmt.Errorf("row %d parse value: %w", row, err)
-	}
-	b.data[len(b.data)-1] = v
-	b.valid.Append(true)
-	return nil
-}
-func (b *genericBuilder[T]) Build(name string) array.Column {
-	return b.construct(name, b.data, b.valid.Build())
-}
-
-type utf8Builder struct {
-	offsets []int32
-	bytes   []byte
-	valid   array.BitmapBuilder
-	nulls   csvio.NullMatcher
-}
-
-func (b *utf8Builder) Append(raw string, _ int) error {
-	if b.nulls.IsNull(raw) {
-		b.valid.Append(false)
-		b.offsets = append(b.offsets, int32(len(b.bytes)))
-		return nil
-	}
-	b.valid.Append(true)
-	b.bytes = append(b.bytes, raw...)
-	b.offsets = append(b.offsets, int32(len(b.bytes)))
-	return nil
-}
-func (b *utf8Builder) Build(name string) array.Column {
-	return array.NewUtf8ColumnOwned(name, b.offsets, b.bytes, b.valid.Build())
-}
-
-func newBuilder(dtype array.DataType, nulls csvio.NullMatcher, rowsCap int) typedBuilder {
-	if rowsCap < 16 {
-		rowsCap = 16
-	}
-	switch dtype.Kind {
-	case array.KindInt:
-		return &genericBuilder[int64]{
-			data:  make([]int64, 0, rowsCap),
-			nulls: nulls,
-			parse: func(raw string) (int64, error) { return strconv.ParseInt(raw, 10, 64) },
-			construct: func(name string, data []int64, valid array.Bitmap) array.Column {
-				return array.NewInt64ColumnOwned(name, data, valid)
-			},
-		}
+		return array.NewInt64ColumnOwned(name, data, valid.Build()), nil
 	case array.KindFloat:
-		return &genericBuilder[float64]{
-			data:  make([]float64, 0, rowsCap),
-			nulls: nulls,
-			parse: func(raw string) (float64, error) { return strconv.ParseFloat(raw, 64) },
-			construct: func(name string, data []float64, valid array.Bitmap) array.Column {
-				return array.NewFloat64ColumnOwned(name, data, valid)
-			},
+		data := make([]float64, len(rows))
+		valid := array.BitmapBuilder{}
+		for i := range rows {
+			if cancellable && (i&ctxCheckMask) == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			v, ok := rows[i][name]
+			if !ok || v == nil || isNullString(v) {
+				valid.Append(false)
+				continue
+			}
+			n, ok := toFloat64(v)
+			if !ok {
+				return nil, fmt.Errorf("row %d parse value: cannot parse float64", i+1)
+			}
+			data[i] = n
+			valid.Append(true)
 		}
+		return array.NewFloat64ColumnOwned(name, data, valid.Build()), nil
 	case array.KindBool:
-		return &genericBuilder[bool]{
-			data:  make([]bool, 0, rowsCap),
-			nulls: nulls,
-			parse: func(raw string) (bool, error) { return strconv.ParseBool(strings.ToLower(raw)) },
-			construct: func(name string, data []bool, valid array.Bitmap) array.Column {
-				return array.NewBoolColumnOwned(name, data, valid)
-			},
+		data := make([]bool, len(rows))
+		valid := array.BitmapBuilder{}
+		for i := range rows {
+			if cancellable && (i&ctxCheckMask) == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			v, ok := rows[i][name]
+			if !ok || v == nil || isNullString(v) {
+				valid.Append(false)
+				continue
+			}
+			n, ok := toBool(v)
+			if !ok {
+				return nil, fmt.Errorf("row %d parse value: cannot parse bool", i+1)
+			}
+			data[i] = n
+			valid.Append(true)
 		}
+		return array.NewBoolColumnOwned(name, data, valid.Build()), nil
 	default:
-		return &utf8Builder{offsets: make([]int32, 1, rowsCap+1), bytes: make([]byte, 0, rowsCap*8), nulls: nulls}
+		offsets := make([]int32, 1, len(rows)+1)
+		bytesOut := make([]byte, 0, len(rows)*8)
+		valid := array.BitmapBuilder{}
+		for i := range rows {
+			if cancellable && (i&ctxCheckMask) == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			v, ok := rows[i][name]
+			if !ok || v == nil || isNullString(v) {
+				valid.Append(false)
+				offsets = append(offsets, int32(len(bytesOut)))
+				continue
+			}
+			raw := toStringValue(v)
+			valid.Append(true)
+			bytesOut = append(bytesOut, raw...)
+			offsets = append(offsets, int32(len(bytesOut)))
+		}
+		return array.NewUtf8ColumnOwned(name, offsets, bytesOut, valid.Build()), nil
 	}
 }
 
-func inferType(values []string, nulls csvio.NullMatcher) array.DataType {
+func toStringValue(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int:
+		return strconv.Itoa(x)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func inferType(rows []map[string]any, key string) array.DataType {
 	allInt := true
 	allFloat := true
 	allBool := true
-	for i := range values {
-		if nulls.IsNull(values[i]) {
+	for i := range rows {
+		v, ok := rows[i][key]
+		if !ok || v == nil || isNullString(v) {
 			continue
 		}
-		if _, err := strconv.ParseInt(values[i], 10, 64); err != nil {
+		if _, ok := toInt64(v); !ok {
 			allInt = false
 		}
-		if _, err := strconv.ParseFloat(values[i], 64); err != nil {
+		if _, ok := toFloat64(v); !ok {
 			allFloat = false
 		}
-		if _, err := strconv.ParseBool(strings.ToLower(values[i])); err != nil {
+		if _, ok := toBool(v); !ok {
 			allBool = false
 		}
 		if !allInt && !allFloat && !allBool {
@@ -324,4 +365,87 @@ func inferType(values []string, nulls csvio.NullMatcher) array.DataType {
 		return array.Bool()
 	}
 	return array.Utf8()
+}
+
+func isNullString(v any) bool {
+	s, ok := v.(string)
+	return ok && s == ""
+}
+
+func toInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case float64:
+		if x < float64(-1<<63) || x > float64((1<<63)-1) {
+			return 0, false
+		}
+		n := int64(x)
+		if float64(n) != x {
+			return 0, false
+		}
+		return n, true
+	case string:
+		n, err := strconv.ParseInt(x, 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return 0, false
+		}
+		return x, true
+	case int64:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case string:
+		n, err := strconv.ParseFloat(x, 64)
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+func toBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		b, err := parseBoolASCII(x)
+		return b, err == nil
+	default:
+		return false, false
+	}
+}
+
+func parseBoolASCII(raw string) (bool, error) {
+	if len(raw) == 4 {
+		if (raw[0] == 't' || raw[0] == 'T') &&
+			(raw[1] == 'r' || raw[1] == 'R') &&
+			(raw[2] == 'u' || raw[2] == 'U') &&
+			(raw[3] == 'e' || raw[3] == 'E') {
+			return true, nil
+		}
+	}
+	if len(raw) == 5 {
+		if (raw[0] == 'f' || raw[0] == 'F') &&
+			(raw[1] == 'a' || raw[1] == 'A') &&
+			(raw[2] == 'l' || raw[2] == 'L') &&
+			(raw[3] == 's' || raw[3] == 'S') &&
+			(raw[4] == 'e' || raw[4] == 'E') {
+			return false, nil
+		}
+	}
+	return strconv.ParseBool(raw)
 }

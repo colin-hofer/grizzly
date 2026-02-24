@@ -35,12 +35,3 @@ func (s Schema) Lookup(name string) (Field, bool) {
 	}
 	return s.Fields[i], true
 }
-
-// Series is a named 1-D typed column.
-type Series struct {
-	Col Column
-}
-
-func (s Series) Name() string    { return s.Col.Name() }
-func (s Series) DType() DataType { return s.Col.DType() }
-func (s Series) Len() int        { return s.Col.Len() }

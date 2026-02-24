@@ -289,10 +289,6 @@ func NewBoolColumnOwned(name string, data []bool, valid Bitmap) Column {
 	return &BoolColumn{typedColumn[bool]{name: name, data: data, valid: valid, ops: boolOps, build: NewBoolColumnOwned}}
 }
 
-func NewBoolColumnOwnedFromMask(name string, data []bool, valid []bool) *BoolColumn {
-	return &BoolColumn{typedColumn[bool]{name: name, data: data, valid: NewBitmapFromBools(valid), ops: boolOps, build: NewBoolColumnOwned}}
-}
-
 func NewUtf8ColumnOwned(name string, offsets []int32, bytes []byte, valid Bitmap) Column {
 	return &Utf8Column{name: name, offsets: offsets, bytes: bytes, valid: valid}
 }
